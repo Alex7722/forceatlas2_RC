@@ -2,22 +2,14 @@
 
 ForceAtlas2, the graph layout algorithm of [Gephi](https://gephi.org), for R.
 
-* **Fast**: written in C, with the Barnes-Hut approximation for large graphs
-  and optional multithreading.
+* **Fast**: written in C, with the Barnes-Hut approximation for large graphs,
+  optional multithreading, and an optional GPU backend.
 * **Light**: the only dependency is igraph (which tidygraph already requires).
-  No Java, no Rcpp, no system library.
+  No Java, no Rcpp, no CUDA toolkit, no system library.
 * **Tidy**: `forceatlas2()` takes a `tbl_graph` and returns it with `x` and `y`
   columns added to the node table.
 
 ## Installation
-
-From the source archive:
-
-```r
-install.packages("forceatlas2r_0.1.0.tar.gz", repos = NULL, type = "source")
-```
-
-or directly from GitHub:
 
 ```r
 remotes::install_github("Alex7722/forceatlas2_RC")
@@ -115,6 +107,34 @@ graph %>%
   mutate(pinned = centrality_degree() > 20) %>%
   forceatlas2(init = c("x", "y"), fixed = "pinned")
 ```
+
+## Using a graphics card
+
+`forceatlas2_gpu()` and `layout_forceatlas2_gpu()` take the same arguments and
+compute the repulsion between the nodes, which is nearly all of the work, on a
+GPU:
+
+```r
+gpu_devices()                       # is the card found?
+
+graph <- graph %>% forceatlas2_gpu()
+xy <- layout_forceatlas2_gpu(g, iterations = 500)
+```
+
+The GPU is driven through OpenCL, which comes with the driver of the graphics
+card. There is nothing else to install and nothing more is needed to build the
+package: the OpenCL library is looked up when a GPU layout is first requested.
+NVIDIA cards are the target (Windows and Linux); other cards that provide
+OpenCL should work too.
+
+* Below 10,000 nodes every pair of nodes is computed; above, the Barnes-Hut
+  tree is built on the CPU at each iteration and traversed on the GPU
+  (`barnes_hut` overrides this).
+* The GPU computes in single precision by default. The layout is of the same
+  quality but not identical to the CPU one; `precision = "double"` gives the
+  same layout as the CPU, more slowly on most cards.
+* A GPU only pays off for large graphs: for a few thousand nodes, the CPU
+  version is as fast.
 
 ## Differences with Gephi
 

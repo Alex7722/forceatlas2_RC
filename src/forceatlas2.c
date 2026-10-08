@@ -29,33 +29,11 @@
 #include <omp.h>
 #endif
 
-/* ------------------------------------------------------------------------ */
-/* Barnes-Hut tree                                                          */
-/* ------------------------------------------------------------------------ */
+#include "fa2.h"
 
-/*
- * Regions are stored in one flat array. A region covers the nodes
- * perm[start .. start + count - 1]; its children (if any) are the regions
- * child .. child + nchild - 1. As in Gephi, a region is split in four around
- * its centre of mass and its "size" is twice the largest distance between
- * the centre of mass and one of its nodes. A region is approximated by a
- * single node of the same mass when distance * theta > size.
- */
-typedef struct {
-    double mass, cx, cy, size;
-    int start, count;
-    int child, nchild;
-} fa2_region;
-
-typedef struct {
-    fa2_region *reg;
-    int nreg;
-    int *perm; /* node indices, grouped by region */
-    int *tmp;  /* scratch space for partitioning */
-    /* Positions, masses and radii of the nodes in the order of perm, so that
-     * the nodes of a region are contiguous in memory. */
-    double *px, *py, *pm, *ps;
-} fa2_tree;
+/* ------------------------------------------------------------------------ */
+/* Barnes-Hut tree (the data structures are described in fa2.h)             */
+/* ------------------------------------------------------------------------ */
 
 /* Regions with at most this many nodes are not split any further: when such
  * a region is too close to be approximated, its nodes are visited directly. */
@@ -103,6 +81,7 @@ static void tree_build(fa2_tree *t, int n, const double *x, const double *y,
     for (int i = 0; i < n; i++) perm[i] = i;
     reg[0].start = 0;
     reg[0].count = n;
+    reg[0].skip = -1;
     region_init(&reg[0], perm, x, y, mass);
     t->nreg = 1;
 
@@ -128,9 +107,11 @@ static void tree_build(fa2_tree *t, int n, const double *x, const double *y,
              * make each of them a leaf. */
             reg[r].nchild = count;
             for (int k = start; k < end; k++) {
-                fa2_region *c = &reg[t->nreg++];
+                const int idx = t->nreg++;
+                fa2_region *c = &reg[idx];
                 c->start = k;
                 c->count = 1;
+                c->skip = idx == reg[r].child ? reg[r].skip : idx - 1;
                 region_init(c, perm, x, y, mass);
             }
             continue;
@@ -149,9 +130,11 @@ static void tree_build(fa2_tree *t, int n, const double *x, const double *y,
 
         for (int q = 0; q < 4; q++) {
             if (cnt[q] == 0) continue;
-            fa2_region *c = &reg[t->nreg++];
+            const int idx = t->nreg++;
+            fa2_region *c = &reg[idx];
             c->start = off[q];
             c->count = cnt[q];
+            c->skip = idx == reg[r].child ? reg[r].skip : idx - 1;
             region_init(c, perm, x, y, mass);
             reg[r].nchild++;
         }
@@ -241,7 +224,12 @@ static void repulse_all_exact_symmetric(const fa2_state *s)
     }
 }
 
-/* Repulsion exerted on node i, approximated with the Barnes-Hut tree. */
+/* Repulsion exerted on node i, approximated with the Barnes-Hut tree. The
+ * GPU kernel fa2_bh (gpu.c) visits the same regions in the same order, but
+ * follows the `skip` links of the regions instead of using a stack. (On a
+ * CPU the stack is much faster: with the links, the next region to visit is
+ * only known once the distance test is computed, which prevents the processor
+ * from working on several regions at once.) */
 static void repulse_node_bh(const fa2_state *s, const fa2_tree *t, int i,
                             int *stack)
 {
@@ -265,6 +253,7 @@ static void repulse_node_bh(const fa2_state *s, const fa2_tree *t, int i,
                 continue;
             }
             if (r->nchild > 0) {
+                /* The last child is on top of the stack: visited first. */
                 for (int c = 0; c < r->nchild; c++) stack[sp++] = r->child + c;
                 continue;
             }
@@ -338,10 +327,27 @@ static void attract_all(const fa2_state *s, double coef)
  * flags_      c(strong gravity, linlog, outbound distribution, adjust sizes,
  *               Barnes-Hut)
  * threads_    number of OpenMP threads
+ * gpu_        c(device, double precision): the 0-based index of the OpenCL
+ *             device that computes the repulsion, or -1 to use the CPU, and
+ *             whether that device computes in double precision
  */
+
+/* R_CheckUserInterrupt() does not return when the user interrupts, which
+ * would leak the resources held on the GPU. This reports the interruption
+ * instead, so that they can be released first. */
+static void check_interrupt_fn(void *dummy)
+{
+    (void) dummy;
+    R_CheckUserInterrupt();
+}
+static int user_interrupted(void)
+{
+    return R_ToplevelExec(check_interrupt_fn, NULL) == FALSE;
+}
+
 SEXP C_forceatlas2(SEXP n_, SEXP from_, SEXP to_, SEXP w_, SEXP pos_,
                    SEXP size_, SEXP fixed_, SEXP iter_, SEXP dpar_,
-                   SEXP flags_, SEXP threads_)
+                   SEXP flags_, SEXP threads_, SEXP gpu_)
 {
     const int n = asInteger(n_);
     const int m = LENGTH(from_);
@@ -361,6 +367,9 @@ SEXP C_forceatlas2(SEXP n_, SEXP from_, SEXP to_, SEXP w_, SEXP pos_,
     if (!isLogical(flags_) || LENGTH(flags_) != 5) error("invalid flags");
     if (iterations == NA_INTEGER || iterations < 0)
         error("invalid number of iterations");
+    if (!isInteger(gpu_) || LENGTH(gpu_) != 2) error("invalid GPU settings");
+    const int gpu_device = INTEGER(gpu_)[0];
+    const int gpu_double = INTEGER(gpu_)[1] != 0;
     if (threads == NA_INTEGER || threads < 1) threads = 1;
 #ifndef _OPENMP
     threads = 1;
@@ -434,7 +443,15 @@ SEXP C_forceatlas2(SEXP n_, SEXP from_, SEXP to_, SEXP w_, SEXP pos_,
         tree.py = (double *) R_alloc(n, sizeof(double));
         tree.pm = (double *) R_alloc(n, sizeof(double));
         tree.ps = s.adjust ? (double *) R_alloc(n, sizeof(double)) : NULL;
-        stacks = (int *) R_alloc(stack_len * (size_t) threads, sizeof(int));
+        if (gpu_device < 0)
+            stacks = (int *) R_alloc(stack_len * (size_t) threads, sizeof(int));
+    }
+
+    /* From here on, no R error may be raised while `gpu` is open. */
+    fa2_gpu *gpu = NULL;
+    if (gpu_device >= 0) {
+        gpu = fa2_gpu_open(gpu_device, gpu_double, n, s.adjust, barnes_hut);
+        if (!gpu) error("%s", fa2_gpu_error());
     }
 
     const double attraction_coef = s.outbound ? mean_mass : 1.0;
@@ -445,7 +462,14 @@ SEXP C_forceatlas2(SEXP n_, SEXP from_, SEXP to_, SEXP w_, SEXP pos_,
         /* Let the user interrupt long computations. */
         work += (double) n + (double) m;
         if (work >= 1e6) {
-            R_CheckUserInterrupt();
+            if (gpu) {
+                if (user_interrupted()) {
+                    fa2_gpu_close(gpu);
+                    error("the layout was interrupted");
+                }
+            } else {
+                R_CheckUserInterrupt();
+            }
             work = 0.0;
         }
 
@@ -455,14 +479,29 @@ SEXP C_forceatlas2(SEXP n_, SEXP from_, SEXP to_, SEXP w_, SEXP pos_,
         memset(s.dy, 0, (size_t) n * sizeof(double));
 
         /* Repulsion */
-        if (barnes_hut) {
+        if (gpu) {
+            int failed;
+            if (barnes_hut) {
+                tree_build(&tree, n, s.x, s.y, mass, s.adjust ? s.size : NULL);
+                failed = fa2_gpu_repulse_bh(gpu, &tree, s.scaling, s.theta,
+                                            s.dx, s.dy);
+            } else {
+                failed = fa2_gpu_repulse_exact(gpu, s.x, s.y, mass,
+                                               s.adjust ? s.size : NULL,
+                                               s.scaling, s.dx, s.dy);
+            }
+            if (failed) {
+                fa2_gpu_close(gpu);
+                error("%s", fa2_gpu_error());
+            }
+        } else if (barnes_hut) {
             tree_build(&tree, n, s.x, s.y, mass, s.adjust ? s.size : NULL);
-#ifdef _OPENMP
-#pragma omp parallel for num_threads(threads) schedule(dynamic, 64) if (threads > 1)
-#endif
             /* Nodes are visited in the order of the tree: consecutive nodes
              * are neighbours in space and traverse the same regions, which
              * makes a much better use of the CPU caches. */
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(threads) schedule(dynamic, 64) if (threads > 1)
+#endif
             for (int k = 0; k < n; k++) {
 #ifdef _OPENMP
                 int *stack = stacks + stack_len * (size_t) omp_get_thread_num();
@@ -555,7 +594,45 @@ SEXP C_forceatlas2(SEXP n_, SEXP from_, SEXP to_, SEXP w_, SEXP pos_,
         }
     }
 
+    fa2_gpu_close(gpu);
     UNPROTECT(1);
+    return ans;
+}
+
+/* The OpenCL devices of this computer, as a list of columns. */
+SEXP C_gpu_devices(void)
+{
+    const int nd = fa2_gpu_ndevices();
+    const char *names[] = {"name", "vendor", "platform", "version",
+                           "type", "memory_gb", "double", ""};
+    SEXP ans = PROTECT(mkNamed(VECSXP, names));
+    SEXP name = PROTECT(allocVector(STRSXP, nd));
+    SEXP vendor = PROTECT(allocVector(STRSXP, nd));
+    SEXP platform = PROTECT(allocVector(STRSXP, nd));
+    SEXP version = PROTECT(allocVector(STRSXP, nd));
+    SEXP type = PROTECT(allocVector(STRSXP, nd));
+    SEXP memory = PROTECT(allocVector(REALSXP, nd));
+    SEXP dbl = PROTECT(allocVector(LGLSXP, nd));
+    for (int i = 0; i < nd; i++) {
+        fa2_gpu_devinfo info;
+        memset(&info, 0, sizeof(info));
+        fa2_gpu_device_info(i, &info);
+        SET_STRING_ELT(name, i, mkChar(info.name));
+        SET_STRING_ELT(vendor, i, mkChar(info.vendor));
+        SET_STRING_ELT(platform, i, mkChar(info.platform));
+        SET_STRING_ELT(version, i, mkChar(info.version));
+        SET_STRING_ELT(type, i, mkChar(info.is_gpu ? "GPU" : "other"));
+        REAL(memory)[i] = info.memory / 1073741824.0;
+        LOGICAL(dbl)[i] = info.has_double;
+    }
+    SET_VECTOR_ELT(ans, 0, name);
+    SET_VECTOR_ELT(ans, 1, vendor);
+    SET_VECTOR_ELT(ans, 2, platform);
+    SET_VECTOR_ELT(ans, 3, version);
+    SET_VECTOR_ELT(ans, 4, type);
+    SET_VECTOR_ELT(ans, 5, memory);
+    SET_VECTOR_ELT(ans, 6, dbl);
+    UNPROTECT(8);
     return ans;
 }
 
@@ -570,7 +647,8 @@ SEXP C_has_openmp(void)
 }
 
 static const R_CallMethodDef call_methods[] = {
-    {"C_forceatlas2", (DL_FUNC) &C_forceatlas2, 11},
+    {"C_forceatlas2", (DL_FUNC) &C_forceatlas2, 12},
+    {"C_gpu_devices", (DL_FUNC) &C_gpu_devices, 0},
     {"C_has_openmp", (DL_FUNC) &C_has_openmp, 0},
     {NULL, NULL, 0}};
 
@@ -579,4 +657,10 @@ void R_init_forceatlas2r(DllInfo *dll)
     R_registerRoutines(dll, NULL, call_methods, NULL, NULL);
     R_useDynamicSymbols(dll, FALSE);
     R_forceSymbols(dll, TRUE);
+}
+
+void R_unload_forceatlas2r(DllInfo *dll)
+{
+    (void) dll;
+    fa2_gpu_shutdown();
 }

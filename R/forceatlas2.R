@@ -112,6 +112,8 @@
 #'   effect if the package was compiled without OpenMP support (the default
 #'   toolchain on macOS), in which case a single thread is used.
 #'
+#' @seealso [forceatlas2_gpu()] to compute the layout on a graphics card.
+#'
 #' @return
 #' `forceatlas2()` returns `graph`, of the same class as its input, with the
 #' two coordinate columns added to its nodes (replacing existing columns with
@@ -158,10 +160,7 @@ forceatlas2 <- function(graph, iterations = 1000, scaling_ratio = NULL,
                         invert_weights = FALSE, init = NULL, fixed = NULL,
                         jitter_tolerance = 1, barnes_hut = NULL, theta = 1.2,
                         threads = 1, coords = c("x", "y")) {
-  if (!is.character(coords) || length(coords) != 2L || anyNA(coords) ||
-      any(!nzchar(coords)) || coords[1L] == coords[2L]) {
-    stop("`coords` must be two different column names.", call. = FALSE)
-  }
+  coords <- check_coords(coords)
   xy <- layout_forceatlas2(
     graph, iterations = iterations, scaling_ratio = scaling_ratio,
     gravity = gravity, strong_gravity = strong_gravity, linlog = linlog,
@@ -172,17 +171,7 @@ forceatlas2 <- function(graph, iterations = 1000, scaling_ratio = NULL,
     init = init, fixed = fixed, jitter_tolerance = jitter_tolerance,
     barnes_hut = barnes_hut, theta = theta, threads = threads
   )
-  out <- graph
-  igraph::vertex_attr(out, coords[1L]) <- xy[, 1L]
-  igraph::vertex_attr(out, coords[2L]) <- xy[, 2L]
-  # A tbl_graph must stay a tbl_graph, with the same active table and groups.
-  # `vertex_attr<-` normally keeps the class and attributes of the object;
-  # this makes sure of it whatever the version of igraph.
-  for (a in setdiff(names(attributes(graph)), names(attributes(out)))) {
-    attr(out, a) <- attr(graph, a)
-  }
-  if (!identical(class(out), class(graph))) class(out) <- class(graph)
-  out
+  set_coords(graph, xy, coords)
 }
 
 #' @param coords Names of the two node columns in which `forceatlas2()`
@@ -198,6 +187,26 @@ layout_forceatlas2 <- function(graph, iterations = 1000, scaling_ratio = NULL,
                                invert_weights = FALSE, init = NULL,
                                fixed = NULL, jitter_tolerance = 1,
                                barnes_hut = NULL, theta = 1.2, threads = 1) {
+  fa2_layout(
+    graph, iterations = iterations, scaling_ratio = scaling_ratio,
+    gravity = gravity, strong_gravity = strong_gravity, linlog = linlog,
+    dissuade_hubs = dissuade_hubs, prevent_overlap = prevent_overlap,
+    node_size = node_size, weights = weights,
+    edge_weight_influence = edge_weight_influence,
+    normalize_weights = normalize_weights, invert_weights = invert_weights,
+    init = init, fixed = fixed, jitter_tolerance = jitter_tolerance,
+    barnes_hut = barnes_hut, theta = theta, threads = threads
+  )
+}
+
+# The function behind layout_forceatlas2() and layout_forceatlas2_gpu().
+# `gpu` is NULL to compute on the CPU, or list(device =, precision =).
+fa2_layout <- function(graph, iterations, scaling_ratio, gravity,
+                       strong_gravity, linlog, dissuade_hubs, prevent_overlap,
+                       node_size, weights, edge_weight_influence,
+                       normalize_weights, invert_weights, init, fixed,
+                       jitter_tolerance, barnes_hut, theta, threads = 1,
+                       gpu = NULL) {
   if (!igraph::is_igraph(graph)) {
     stop("`graph` must be a tbl_graph or an igraph object, not an object of ",
          "class <", class(graph)[1L], ">.", call. = FALSE)
@@ -227,11 +236,17 @@ layout_forceatlas2 <- function(graph, iterations = 1000, scaling_ratio = NULL,
                                   strict = TRUE)
   }
   if (is.null(barnes_hut)) {
-    barnes_hut <- n >= 1000
+    # Computing every pair of nodes stays affordable for longer on a GPU.
+    barnes_hut <- n >= if (is.null(gpu)) 1000 else 10000
   } else {
     barnes_hut <- check_flag(barnes_hut, "barnes_hut")
   }
   if (threads > 1 && !.Call(C_has_openmp)) threads <- 1
+
+  gpu_settings <- c(-1L, 0L)
+  if (!is.null(gpu)) {
+    gpu_settings <- gpu_resolve(gpu$device, gpu$precision)
+  }
 
   w <- edge_weights(graph, weights, m)
   if (invert_weights) w <- ifelse(w == 0, 0, 1 / w)
@@ -269,10 +284,34 @@ layout_forceatlas2 <- function(graph, iterations = 1000, scaling_ratio = NULL,
     as.integer(iterations),
     as.double(c(scaling_ratio, gravity, jitter_tolerance, theta)),
     c(strong_gravity, linlog, dissuade_hubs, prevent_overlap, barnes_hut),
-    as.integer(threads)
+    as.integer(threads),
+    gpu_settings
   )
   dimnames(xy) <- NULL
   xy
+}
+
+# Store a layout in the node table of a graph.
+set_coords <- function(graph, xy, coords) {
+  out <- graph
+  igraph::vertex_attr(out, coords[1L]) <- xy[, 1L]
+  igraph::vertex_attr(out, coords[2L]) <- xy[, 2L]
+  # A tbl_graph must stay a tbl_graph, with the same active table and groups.
+  # `vertex_attr<-` normally keeps the class and attributes of the object;
+  # this makes sure of it whatever the version of igraph.
+  for (a in setdiff(names(attributes(graph)), names(attributes(out)))) {
+    attr(out, a) <- attr(graph, a)
+  }
+  if (!identical(class(out), class(graph))) class(out) <- class(graph)
+  out
+}
+
+check_coords <- function(coords) {
+  if (!is.character(coords) || length(coords) != 2L || anyNA(coords) ||
+      any(!nzchar(coords)) || coords[1L] == coords[2L]) {
+    stop("`coords` must be two different column names.", call. = FALSE)
+  }
+  coords
 }
 
 # Helpers ---------------------------------------------------------------------

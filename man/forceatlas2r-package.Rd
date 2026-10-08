@@ -6,7 +6,7 @@
 \alias{forceatlas2r-package}
 \title{forceatlas2r: Fast 'ForceAtlas2' Graph Layout for 'tidygraph' and 'igraph'}
 \description{
-A compiled (C) implementation of the 'ForceAtlas2' graph layout algorithm of Jacomy, Venturini, Heymann and Bastian (2014) \doi{10.1371/journal.pone.0098679}, following the reference implementation shipped with 'Gephi'. It supports LinLog mode, strong gravity, hub dissuasion, overlap prevention, edge weights, pinned nodes, the Barnes-Hut approximation and optional multithreading. The layout can be added directly to the node table of a 'tidygraph' graph, or computed as a coordinate matrix for 'igraph' and 'ggraph'.
+A compiled (C) implementation of the 'ForceAtlas2' graph layout algorithm of Jacomy, Venturini, Heymann and Bastian (2014) \doi{10.1371/journal.pone.0098679}, following the reference implementation shipped with 'Gephi'. It supports LinLog mode, strong gravity, hub dissuasion, overlap prevention, edge weights, pinned nodes, the Barnes-Hut approximation and optional multithreading. The layout can be added directly to the node table of a 'tidygraph' graph, or computed as a coordinate matrix for 'igraph' and 'ggraph'. The layout can also be computed on a graphics card through 'OpenCL', which is loaded at run time and is not needed to install the package.
 }
 \author{
 \strong{Maintainer}: Your Name \email{you@example.com}
