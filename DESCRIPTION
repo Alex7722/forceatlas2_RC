@@ -1,0 +1,25 @@
+Package: forceatlas2r
+Title: Fast 'ForceAtlas2' Graph Layout for 'tidygraph' and 'igraph'
+Version: 0.1.0
+Authors@R: c(
+    person("Your", "Name", email = "you@example.com", role = c("aut", "cre")),
+    person("Mathieu", "Jacomy", role = "ctb",
+           comment = "Author of the ForceAtlas2 algorithm and of the Gephi reference implementation"),
+    person("Gephi Consortium", role = "cph",
+           comment = "Reference implementation this package follows"))
+Description: A compiled (C) implementation of the 'ForceAtlas2' graph layout
+    algorithm of Jacomy, Venturini, Heymann and Bastian (2014)
+    <doi:10.1371/journal.pone.0098679>, following the reference implementation
+    shipped with 'Gephi'. It supports LinLog mode, strong gravity, hub
+    dissuasion, overlap prevention, edge weights, pinned nodes, the
+    Barnes-Hut approximation and optional multithreading. The layout can be
+    added directly to the node table of a 'tidygraph' graph, or computed as a
+    coordinate matrix for 'igraph' and 'ggraph'.
+License: GPL (>= 3)
+Encoding: UTF-8
+Depends: R (>= 3.5.0)
+Imports: igraph (>= 1.0.0), stats
+Suggests: tidygraph, testthat (>= 3.0.0)
+Config/testthat/edition: 3
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.1
