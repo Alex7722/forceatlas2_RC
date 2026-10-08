@@ -1,6 +1,6 @@
 Package: forceatlas2r
 Title: Fast 'ForceAtlas2' Graph Layout for 'tidygraph' and 'igraph'
-Version: 0.2.1
+Version: 0.2.2
 Authors@R: c(
     person("Your", "Name", email = "you@example.com", role = c("aut", "cre")),
     person("Mathieu", "Jacomy", role = "ctb",

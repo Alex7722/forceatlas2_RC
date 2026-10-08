@@ -545,7 +545,7 @@ int fa2_gpu_repulse_exact(fa2_gpu *g, const double *x, const double *y,
 
     double t0 = fa2_now(), t1;
     nodes_to_device(g, x, y, mass, size);
-    err = cl->EnqueueWriteBuffer(cache.queue, g->buf_p, CL_TRUE, 0,
+    err = cl->EnqueueWriteBuffer(cache.queue, g->buf_p, CL_FALSE, 0,
                                  4 * n * g->real_size, g->host_p, 0, NULL,
                                  NULL);
     if (err != CL_SUCCESS) goto fail;
@@ -604,15 +604,17 @@ int fa2_gpu_repulse_bh(fa2_gpu *g, const fa2_tree *t, double scaling,
     nodes_to_device(g, t->px, t->py, t->pm, t->ps);
     regions_to_device(g, t);
 
-    err = cl->EnqueueWriteBuffer(cache.queue, g->buf_p, CL_TRUE, 0,
+    /* The writes are not blocking: the host arrays are left untouched until
+     * the result has been read, which waits for everything before it. */
+    err = cl->EnqueueWriteBuffer(cache.queue, g->buf_p, CL_FALSE, 0,
                                  4 * n * g->real_size, g->host_p, 0, NULL,
                                  NULL);
     if (!err)
-        err = cl->EnqueueWriteBuffer(cache.queue, g->buf_rr, CL_TRUE, 0,
+        err = cl->EnqueueWriteBuffer(cache.queue, g->buf_rr, CL_FALSE, 0,
                                      4 * nreg * g->real_size, g->host_rr, 0,
                                      NULL, NULL);
     if (!err)
-        err = cl->EnqueueWriteBuffer(cache.queue, g->buf_ri, CL_TRUE, 0,
+        err = cl->EnqueueWriteBuffer(cache.queue, g->buf_ri, CL_FALSE, 0,
                                      4 * nreg * sizeof(int), g->host_ri, 0,
                                      NULL, NULL);
     if (err != CL_SUCCESS) goto fail;

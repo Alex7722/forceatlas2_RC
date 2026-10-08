@@ -39,64 +39,62 @@
  * a region is too close to be approximated, its nodes are visited directly. */
 #define FA2_LEAF_SIZE 8
 
-static void region_init(fa2_region *r, const int *perm, const double *x,
-                        const double *y, const double *mass)
-{
-    r->child = -1;
-    r->nchild = 0;
-    if (r->count > 1) {
-        double m = 0.0, sx = 0.0, sy = 0.0, d2max = 0.0;
-        const int end = r->start + r->count;
-        for (int k = r->start; k < end; k++) {
-            const int i = perm[k];
-            m += mass[i];
-            sx += x[i] * mass[i];
-            sy += y[i] * mass[i];
-        }
-        r->mass = m;
-        r->cx = sx / m;
-        r->cy = sy / m;
-        for (int k = r->start; k < end; k++) {
-            const int i = perm[k];
-            const double dx = x[i] - r->cx, dy = y[i] - r->cy;
-            const double d2 = dx * dx + dy * dy;
-            if (d2 > d2max) d2max = d2;
-        }
-        r->size = 2.0 * sqrt(d2max);
-    } else {
-        const int i = perm[r->start];
-        r->mass = mass[i];
-        r->cx = x[i];
-        r->cy = y[i];
-        r->size = 0.0;
-    }
-}
+/* Quadrant of a node around the centre (cx, cy) of its region. */
+#define FA2_QUADRANT(node) (((node).x < cx ? 0 : 2) + ((node).y < cy ? 0 : 1))
 
-/* Quadrant of node i around the point (cx, cy). */
-#define FA2_QUADRANT(i) ((x[i] < cx ? 0 : 2) + (y[i] < cy ? 0 : 1))
+static inline int all_in_one_quadrant(const int *cnt, int count)
+{
+    return cnt[0] == count || cnt[1] == count || cnt[2] == count ||
+           cnt[3] == count;
+}
 
 /*
  * The tree is built breadth first, one level at a time: there is no
  * recursion, hence no risk of exhausting the C stack on degenerate (very
- * deep) trees. The regions of a level cover separate sets of nodes, so they
- * are processed in parallel; the tree does not depend on the number of
- * threads.
+ * deep) trees.
+ *
+ * The nodes (position, mass and index) are kept grouped by region, so that
+ * every pass over a region reads memory sequentially. When a region is split,
+ * its nodes are copied to the other of two buffers, quadrant by quadrant and
+ * without changing their relative order.
+ *
+ * The regions of a level cover separate sets of nodes, so they are processed
+ * in parallel; the tree does not depend on the number of threads.
  */
 static void tree_build(fa2_tree *t, int n, const double *x, const double *y,
                        const double *mass, const double *size, int threads)
 {
-    int *perm = t->perm, *tmp = t->tmp, *cnts = t->cnt;
     fa2_region *reg = t->reg;
+    int *cnts = t->cnt;
 #ifndef _OPENMP
     (void) threads;
 #endif
 
-    for (int i = 0; i < n; i++) perm[i] = i;
-    reg[0].start = 0;
-    reg[0].count = n;
-    reg[0].skip = -1;
-    region_init(&reg[0], perm, x, y, mass);
-    t->nreg = 1;
+    /* The root contains all the nodes. */
+    {
+        fa2_node *nodes = t->buf[0];
+        double m = 0.0, sx = 0.0, sy = 0.0;
+        for (int i = 0; i < n; i++) {
+            nodes[i].x = x[i];
+            nodes[i].y = y[i];
+            nodes[i].m = mass[i];
+            nodes[i].idx = i;
+            m += mass[i];
+            sx += x[i] * mass[i];
+            sy += y[i] * mass[i];
+        }
+        reg[0].start = 0;
+        reg[0].count = n;
+        reg[0].skip = -1;
+        reg[0].buf = 0;
+        reg[0].child = -1;
+        reg[0].nchild = 0;
+        reg[0].mass = n > 1 ? m : mass[0];
+        reg[0].cx = n > 1 ? sx / m : x[0];
+        reg[0].cy = n > 1 ? sy / m : y[0];
+        reg[0].size = 0.0;
+        t->nreg = 1;
+    }
 
     int lo = 0, hi = 1; /* the regions of the current level */
     while (lo < hi) {
@@ -105,34 +103,26 @@ static void tree_build(fa2_tree *t, int n, const double *x, const double *y,
         if (chunk < 1) chunk = 1;
 #endif
 
-        /* 1. Split the nodes of each region between its four quadrants. */
+        /* 1. Size of each region, and number of nodes in its quadrants. */
 #ifdef _OPENMP
 #pragma omp parallel for num_threads(threads) schedule(dynamic, chunk) if (threads > 1 && hi - lo > 1)
 #endif
         for (int r = lo; r < hi; r++) {
-            const int start = reg[r].start, count = reg[r].count;
+            const int count = reg[r].count;
             int *cnt = cnts + 4 * (size_t) (r - lo);
             cnt[0] = cnt[1] = cnt[2] = cnt[3] = 0;
-            if (count <= FA2_LEAF_SIZE) continue;
+            if (count < 2) continue;
 
+            const fa2_node *nodes = t->buf[reg[r].buf] + reg[r].start;
             const double cx = reg[r].cx, cy = reg[r].cy;
-            const int end = start + count;
-            for (int k = start; k < end; k++) cnt[FA2_QUADRANT(perm[k])]++;
-
-            /* All the nodes in the same quadrant (coincident nodes): there
-             * is nothing to reorder, each node will become a leaf. */
-            if (cnt[0] == count || cnt[1] == count || cnt[2] == count ||
-                cnt[3] == count)
-                continue;
-
-            int pos[4];
-            pos[0] = start;
-            for (int q = 1; q < 4; q++) pos[q] = pos[q - 1] + cnt[q - 1];
-            for (int k = start; k < end; k++) {
-                const int i = perm[k];
-                tmp[pos[FA2_QUADRANT(i)]++] = i;
+            double d2max = 0.0;
+            for (int k = 0; k < count; k++) {
+                const double dx = nodes[k].x - cx, dy = nodes[k].y - cy;
+                const double d2 = dx * dx + dy * dy;
+                if (d2 > d2max) d2max = d2;
+                cnt[FA2_QUADRANT(nodes[k])]++;
             }
-            memcpy(perm + start, tmp + start, (size_t) count * sizeof(int));
+            reg[r].size = 2.0 * sqrt(d2max);
         }
 
         /* 2. Create the regions of the next level, in order. */
@@ -142,49 +132,109 @@ static void tree_build(fa2_tree *t, int n, const double *x, const double *y,
             if (count <= FA2_LEAF_SIZE) continue;
 
             reg[r].child = t->nreg;
-            if (cnt[0] == count || cnt[1] == count || cnt[2] == count ||
-                cnt[3] == count) {
+            if (all_in_one_quadrant(cnt, count)) {
+                /* Coincident nodes: each of them becomes a leaf, in place. */
                 reg[r].nchild = count;
                 for (int k = start; k < start + count; k++) {
-                    const int idx = t->nreg++;
-                    reg[idx].start = k;
-                    reg[idx].count = 1;
-                    reg[idx].skip = idx == reg[r].child ? reg[r].skip : idx - 1;
+                    fa2_region *c = &reg[t->nreg];
+                    c->start = k;
+                    c->count = 1;
+                    c->skip = k == start ? reg[r].skip : t->nreg - 1;
+                    c->buf = reg[r].buf;
+                    c->child = -1;
+                    c->nchild = 0;
+                    t->nreg++;
                 }
                 continue;
             }
             int off = start;
             for (int q = 0; q < 4; q++) {
                 if (cnt[q] == 0) continue;
-                const int idx = t->nreg++;
-                reg[idx].start = off;
-                reg[idx].count = cnt[q];
-                reg[idx].skip = idx == reg[r].child ? reg[r].skip : idx - 1;
+                fa2_region *c = &reg[t->nreg];
+                c->start = off;
+                c->count = cnt[q];
+                c->skip = reg[r].nchild == 0 ? reg[r].skip : t->nreg - 1;
+                c->buf = 1 - reg[r].buf;
+                c->child = -1;
+                c->nchild = 0;
                 reg[r].nchild++;
+                t->nreg++;
                 off += cnt[q];
             }
         }
 
-        /* 3. Compute their mass, centre and size. */
-        lo = hi;
-        hi = t->nreg;
+        /* 3. Move the nodes to their quadrant, and compute the mass and the
+         *    centre of the new regions. */
 #ifdef _OPENMP
-        chunk = (hi - lo) / (8 * threads);
-        if (chunk < 1) chunk = 1;
 #pragma omp parallel for num_threads(threads) schedule(dynamic, chunk) if (threads > 1 && hi - lo > 1)
 #endif
-        for (int r = lo; r < hi; r++) region_init(&reg[r], perm, x, y, mass);
+        for (int r = lo; r < hi; r++) {
+            const int count = reg[r].count;
+            const int *cnt = cnts + 4 * (size_t) (r - lo);
+            if (reg[r].nchild == 0) continue;
+
+            const fa2_node *nodes = t->buf[reg[r].buf] + reg[r].start;
+            if (!all_in_one_quadrant(cnt, count)) {
+                fa2_node *out = t->buf[1 - reg[r].buf];
+                const double cx = reg[r].cx, cy = reg[r].cy;
+                double m[4] = {0.0, 0.0, 0.0, 0.0};
+                double sx[4] = {0.0, 0.0, 0.0, 0.0};
+                double sy[4] = {0.0, 0.0, 0.0, 0.0};
+                int pos[4];
+                pos[0] = reg[r].start;
+                for (int q = 1; q < 4; q++) pos[q] = pos[q - 1] + cnt[q - 1];
+
+                for (int k = 0; k < count; k++) {
+                    const int q = FA2_QUADRANT(nodes[k]);
+                    out[pos[q]++] = nodes[k];
+                    m[q] += nodes[k].m;
+                    sx[q] += nodes[k].x * nodes[k].m;
+                    sy[q] += nodes[k].y * nodes[k].m;
+                }
+
+                fa2_region *c = &reg[reg[r].child];
+                for (int q = 0; q < 4; q++) {
+                    if (cnt[q] == 0) continue;
+                    c->mass = m[q];
+                    c->cx = sx[q] / m[q];
+                    c->cy = sy[q] / m[q];
+                    c->size = 0.0;
+                    c++;
+                }
+                nodes = out + reg[r].start;
+            }
+            /* A region of a single node is that node, exactly. */
+            for (int j = 0; j < reg[r].nchild; j++) {
+                fa2_region *c = &reg[reg[r].child + j];
+                if (c->count > 1) continue;
+                const fa2_node *node = nodes + (c->start - reg[r].start);
+                c->mass = node->m;
+                c->cx = node->x;
+                c->cy = node->y;
+                c->size = 0.0;
+            }
+        }
+
+        lo = hi;
+        hi = t->nreg;
     }
 
+    /* The nodes in the order of the tree: those of each region that was not
+     * split are in the buffer where it left them. */
 #ifdef _OPENMP
 #pragma omp parallel for num_threads(threads) schedule(static) if (threads > 1)
 #endif
-    for (int k = 0; k < n; k++) {
-        const int i = perm[k];
-        t->px[k] = x[i];
-        t->py[k] = y[i];
-        t->pm[k] = mass[i];
-        if (size) t->ps[k] = size[i];
+    for (int r = 0; r < t->nreg; r++) {
+        if (reg[r].nchild > 0) continue;
+        const fa2_node *nodes = t->buf[reg[r].buf];
+        for (int k = reg[r].start; k < reg[r].start + reg[r].count; k++) {
+            const int i = nodes[k].idx;
+            t->perm[k] = i;
+            t->px[k] = nodes[k].x;
+            t->py[k] = nodes[k].y;
+            t->pm[k] = nodes[k].m;
+            if (size) t->ps[k] = size[i];
+        }
     }
 }
 
@@ -202,6 +252,10 @@ typedef struct {
     const double *w;
     double scaling, gravity, theta;
     int strong, linlog, outbound, adjust;
+    /* The edges of each node, for the parallel computation of the attraction:
+     * node i has the entries inc[inc_off[i] .. inc_off[i + 1] - 1], each
+     * being 2 * edge + (1 if the node is the target of the edge). */
+    const int *inc_off, *inc;
 } fa2_state;
 
 /* Repulsion factor between two nodes whose centres are sqrt(d2) apart. The
@@ -326,6 +380,24 @@ static inline void gravity_node(const fa2_state *s, int i)
     }
 }
 
+/* Attraction factor of edge e: the force on its source is (xd, yd) * factor
+ * and the force on its target is the opposite. */
+static inline double attraction_factor(const fa2_state *s, int e, double coef,
+                                       double xd, double yd)
+{
+    const int a = s->from[e], b = s->to[e];
+    double f = -coef * s->w[e];
+
+    if (s->adjust || s->linlog) {
+        double dist = sqrt(xd * xd + yd * yd);
+        if (s->adjust) dist -= s->size[a] + s->size[b];
+        if (!(dist > 0)) return 0.0;
+        if (s->linlog) f *= log1p(dist) / dist;
+    }
+    if (s->outbound) f /= s->mass[a];
+    return f;
+}
+
 /* Attraction along the edges. */
 static void attract_all(const fa2_state *s, double coef)
 {
@@ -333,21 +405,39 @@ static void attract_all(const fa2_state *s, double coef)
         const int a = s->from[e], b = s->to[e];
         if (a == b) continue;
         const double xd = s->x[a] - s->x[b], yd = s->y[a] - s->y[b];
-        double f = -coef * s->w[e];
-
-        if (s->adjust || s->linlog) {
-            double dist = sqrt(xd * xd + yd * yd);
-            if (s->adjust) dist -= s->size[a] + s->size[b];
-            if (!(dist > 0)) continue;
-            if (s->linlog) f *= log1p(dist) / dist;
-        }
-        if (s->outbound) f /= s->mass[a];
+        const double f = attraction_factor(s, e, coef, xd, yd);
+        if (f == 0.0) continue;
 
         s->dx[a] += xd * f;
         s->dy[a] += yd * f;
         s->dx[b] -= xd * f;
         s->dy[b] -= yd * f;
     }
+}
+
+/* Attraction exerted on node i by its neighbours. Each edge is computed
+ * twice, once from each end, but the nodes can be processed in parallel. A
+ * node receives the same contributions in the same order as in attract_all(),
+ * so both give identical results. */
+static void attract_node(const fa2_state *s, double coef, int i)
+{
+    double fx = s->dx[i], fy = s->dy[i];
+    for (int k = s->inc_off[i]; k < s->inc_off[i + 1]; k++) {
+        const int e = s->inc[k] >> 1;
+        const int a = s->from[e], b = s->to[e];
+        const double xd = s->x[a] - s->x[b], yd = s->y[a] - s->y[b];
+        const double f = attraction_factor(s, e, coef, xd, yd);
+        if (f == 0.0) continue;
+        if (s->inc[k] & 1) {
+            fx -= xd * f;
+            fy -= yd * f;
+        } else {
+            fx += xd * f;
+            fy += yd * f;
+        }
+    }
+    s->dx[i] = fx;
+    s->dy[i] = fy;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -406,6 +496,7 @@ SEXP C_forceatlas2(SEXP n_, SEXP from_, SEXP to_, SEXP w_, SEXP pos_,
     if (!isLogical(flags_) || LENGTH(flags_) != 5) error("invalid flags");
     if (iterations == NA_INTEGER || iterations < 0)
         error("invalid number of iterations");
+    if (m > (1 << 30) - 1) error("too many edges");
     if (!isInteger(gpu_) || LENGTH(gpu_) != 2) error("invalid GPU settings");
     const int gpu_device = INTEGER(gpu_)[0];
     const int gpu_double = INTEGER(gpu_)[1] != 0;
@@ -466,6 +557,34 @@ SEXP C_forceatlas2(SEXP n_, SEXP from_, SEXP to_, SEXP w_, SEXP pos_,
         s.dx[i] = s.dy[i] = 0.0;
     }
     mean_mass /= n;
+    double *swinging = (double *) R_alloc(n, sizeof(double));
+    double *traction = (double *) R_alloc(n, sizeof(double));
+
+    /* With several threads, the attraction is computed node by node, which
+     * needs the list of the edges of each node (self-loops have no effect). */
+    s.inc_off = NULL;
+    s.inc = NULL;
+    if (threads > 1 && m > 0) {
+        int *off = (int *) R_alloc((size_t) n + 1, sizeof(int));
+        int *inc = (int *) R_alloc(2 * (size_t) m, sizeof(int));
+        memset(off, 0, ((size_t) n + 1) * sizeof(int));
+        for (int e = 0; e < m; e++) {
+            if (from[e] == to[e]) continue;
+            off[from[e] + 1]++;
+            off[to[e] + 1]++;
+        }
+        for (int i = 0; i < n; i++) off[i + 1] += off[i];
+        /* off[i] is used as the insertion point of node i, then restored. */
+        for (int e = 0; e < m; e++) {
+            if (from[e] == to[e]) continue;
+            inc[off[from[e]]++] = 2 * e;
+            inc[off[to[e]]++] = 2 * e + 1;
+        }
+        for (int i = n; i > 0; i--) off[i] = off[i - 1];
+        off[0] = 0;
+        s.inc_off = off;
+        s.inc = inc;
+    }
 
     fa2_tree tree;
     memset(&tree, 0, sizeof(tree));
@@ -477,7 +596,8 @@ SEXP C_forceatlas2(SEXP n_, SEXP from_, SEXP to_, SEXP w_, SEXP pos_,
         stack_len = 2 * (size_t) n;
         tree.reg = (fa2_region *) R_alloc(stack_len, sizeof(fa2_region));
         tree.perm = (int *) R_alloc(n, sizeof(int));
-        tree.tmp = (int *) R_alloc(n, sizeof(int));
+        tree.buf[0] = (fa2_node *) R_alloc(n, sizeof(fa2_node));
+        tree.buf[1] = (fa2_node *) R_alloc(n, sizeof(fa2_node));
         tree.cnt = (int *) R_alloc(4 * (size_t) n, sizeof(int));
         tree.px = (double *) R_alloc(n, sizeof(double));
         tree.py = (double *) R_alloc(n, sizeof(double));
@@ -516,8 +636,15 @@ SEXP C_forceatlas2(SEXP n_, SEXP from_, SEXP to_, SEXP w_, SEXP pos_,
             work = 0.0;
         }
 
-        memcpy(old_dx, s.dx, (size_t) n * sizeof(double));
-        memcpy(old_dy, s.dy, (size_t) n * sizeof(double));
+        /* The forces of the previous iteration are kept. */
+        {
+            double *tmp = old_dx;
+            old_dx = s.dx;
+            s.dx = tmp;
+            tmp = old_dy;
+            old_dy = s.dy;
+            s.dy = tmp;
+        }
         memset(s.dx, 0, (size_t) n * sizeof(double));
         memset(s.dy, 0, (size_t) n * sizeof(double));
 
@@ -567,20 +694,40 @@ SEXP C_forceatlas2(SEXP n_, SEXP from_, SEXP to_, SEXP w_, SEXP pos_,
         time_repulsion += fa2_now() - t0;
 
         /* Gravity */
-        if (s.gravity != 0)
+        if (s.gravity != 0) {
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(threads) schedule(static) if (threads > 1)
+#endif
             for (int i = 0; i < n; i++) gravity_node(&s, i);
+        }
 
         /* Attraction */
-        attract_all(&s, attraction_coef);
+        if (s.inc) {
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(threads) schedule(dynamic, 256)
+#endif
+            for (int i = 0; i < n; i++) attract_node(&s, attraction_coef, i);
+        } else {
+            attract_all(&s, attraction_coef);
+        }
 
-        /* Adaptive global speed */
+        /* Adaptive global speed: how much the nodes swing (change direction
+         * between two iterations) compared to how much they travel. The sums
+         * are always made in the same order, whatever the number of threads. */
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(threads) schedule(static) if (threads > 1)
+#endif
+        for (int i = 0; i < n; i++) {
+            const double sx = old_dx[i] - s.dx[i], sy = old_dy[i] - s.dy[i];
+            const double tx = old_dx[i] + s.dx[i], ty = old_dy[i] + s.dy[i];
+            swinging[i] = mass[i] * sqrt(sx * sx + sy * sy);
+            traction[i] = 0.5 * mass[i] * sqrt(tx * tx + ty * ty);
+        }
         double total_swinging = 0.0, total_traction = 0.0;
         for (int i = 0; i < n; i++) {
             if (fixed[i]) continue;
-            const double sx = old_dx[i] - s.dx[i], sy = old_dy[i] - s.dy[i];
-            const double tx = old_dx[i] + s.dx[i], ty = old_dy[i] + s.dy[i];
-            total_swinging += mass[i] * sqrt(sx * sx + sy * sy);
-            total_traction += 0.5 * mass[i] * sqrt(tx * tx + ty * ty);
+            total_swinging += swinging[i];
+            total_traction += traction[i];
         }
 
         if (total_swinging > 0) {
@@ -618,23 +765,24 @@ SEXP C_forceatlas2(SEXP n_, SEXP from_, SEXP to_, SEXP w_, SEXP pos_,
         /* else: nothing moves at all; keep the current speed. */
 
         /* Apply the forces */
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(threads) schedule(static) if (threads > 1)
+#endif
         for (int i = 0; i < n; i++) {
             if (fixed[i]) continue;
-            const double sx = old_dx[i] - s.dx[i], sy = old_dy[i] - s.dy[i];
-            const double swinging = mass[i] * sqrt(sx * sx + sy * sy);
             double factor;
             if (s.adjust) {
                 /* With overlap prevention the swinging measure is less
                  * reliable: move slower and bound the displacement. */
                 const double df = sqrt(s.dx[i] * s.dx[i] + s.dy[i] * s.dy[i]);
-                factor = 0.1 * speed / (1.0 + sqrt(speed * swinging));
+                factor = 0.1 * speed / (1.0 + sqrt(speed * swinging[i]));
                 if (df > 0) {
                     if (factor * df > 10.0) factor = 10.0 / df;
                 } else {
                     factor = 0.0;
                 }
             } else {
-                factor = speed / (1.0 + sqrt(speed * swinging));
+                factor = speed / (1.0 + sqrt(speed * swinging[i]));
             }
             s.x[i] += s.dx[i] * factor;
             s.y[i] += s.dy[i] * factor;

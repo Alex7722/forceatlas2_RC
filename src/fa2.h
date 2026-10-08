@@ -23,14 +23,21 @@ typedef struct {
     int start, count;
     int child, nchild;
     int skip;
+    int buf; /* during construction: which buffer holds the nodes */
 } fa2_region;
+
+/* A node as it is moved around while the tree is built. */
+typedef struct {
+    double x, y, m;
+    int idx;
+} fa2_node;
 
 typedef struct {
     fa2_region *reg;
     int nreg;
     int *perm; /* node indices, grouped by region */
-    int *tmp;  /* scratch space for partitioning */
     int *cnt;  /* scratch space: nodes per quadrant, for a level of the tree */
+    fa2_node *buf[2]; /* scratch space: the nodes, grouped by region */
     /* Positions, masses and radii of the nodes in the order of perm, so that
      * the nodes of a region are contiguous in memory. */
     double *px, *py, *pm, *ps;
