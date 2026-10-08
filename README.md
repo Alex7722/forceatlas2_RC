@@ -138,6 +138,31 @@ OpenCL should work too.
 * For large graphs, set `threads` to the number of cores of the computer: the
   tree is built on the CPU, and that is what limits the speed.
 
+### Very large graphs
+
+`forceatlas2_large()` and `layout_forceatlas2_large()` go one step further:
+the graph is sent to the card once and every step of every iteration runs
+there, including the construction of the tree used to approximate the
+repulsion. Nothing comes back to the CPU until the layout is finished.
+
+```r
+graph <- graph %>% forceatlas2_large()
+xy <- layout_forceatlas2_large(g, iterations = 500)
+```
+
+They take the same settings as the other functions. The tree is not the one
+of Gephi but one that can be built on a GPU (nodes sorted in Morton order,
+then a binary radix tree), so the layouts are of the same kind but not
+identical to those of `forceatlas2()`; `theta` has about the same effect on
+the precision. They are meant for hundreds of thousands to millions of nodes;
+the card needs about 180 bytes of memory per node and 16 per edge.
+
+| | Repulsion | Tree | Same layout as the CPU |
+|:--|:--|:--|:--|
+| `forceatlas2()` | CPU | CPU | yes |
+| `forceatlas2_gpu()` | GPU | CPU | yes (in double precision) |
+| `forceatlas2_large()` | GPU | GPU | no (same quality) |
+
 ## Differences with Gephi
 
 * Gephi runs the layout until you stop it; here the number of `iterations` is

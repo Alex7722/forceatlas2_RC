@@ -90,4 +90,50 @@ void fa2_gpu_shutdown(void);
 /* A monotonic clock, in seconds (ocl_loader.c). */
 double fa2_now(void);
 
+/* ------------------------------------------------------------------------ */
+/* All-GPU layout (gpu_full.c)                                              */
+/* ------------------------------------------------------------------------ */
+
+typedef struct {
+    int n;
+    /* The edges of node i are the entries inc_off[i] .. inc_off[i + 1] - 1 of
+     * inc_node (the node at the other end) and inc_coef (the strength of the
+     * attraction along the edge). */
+    const int *inc_off, *inc_node;
+    const double *inc_coef;
+    const double *mass;
+    const double *size; /* node radii, used only if adjust */
+    const int *fixed;   /* non-zero for the nodes that must not move */
+    int any_fixed;
+    double scaling, gravity, theta, jitter_tolerance;
+    int strong, linlog, adjust;
+    int iterations;
+    int device, use_double;
+    int profile;                /* measure the time spent in each phase */
+    const char *source;         /* source of the OpenCL kernels */
+    int (*interrupted)(void);   /* returns non-zero to stop the layout */
+} fa2_full_params;
+
+enum {
+    FA2_FULL_T_TOTAL,
+    FA2_FULL_T_CODES,
+    FA2_FULL_T_SORT,
+    FA2_FULL_T_TREE,
+    FA2_FULL_T_REPULSION,
+    FA2_FULL_T_ATTRACTION,
+    FA2_FULL_T_MOVE,
+    FA2_FULL_NTIMES
+};
+
+/* Run the layout. `pos` holds the x then the y coordinates of the nodes, and
+ * receives the result; `times` (FA2_FULL_NTIMES values) the time spent, in
+ * seconds. Returns 0 on success. */
+int fa2_full_run(const fa2_full_params *p, double *pos, double *times);
+
+/* Adaptive global speed of ForceAtlas2 (forceatlas2.c): update the speed
+ * from the total swinging and the total traction of the nodes. */
+void fa2_update_speed(int n, double total_swinging, double total_traction,
+                      double jitter_tolerance, double *speed,
+                      double *speed_efficiency);
+
 #endif

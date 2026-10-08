@@ -223,5 +223,6 @@ for the Gephi Software. \emph{PLoS ONE} 9(6): e98679.
 \doi{10.1371/journal.pone.0098679}
 }
 \seealso{
-\code{\link[=forceatlas2_gpu]{forceatlas2_gpu()}} to compute the layout on a graphics card.
+\code{\link[=forceatlas2_gpu]{forceatlas2_gpu()}} and \code{\link[=forceatlas2_large]{forceatlas2_large()}} to compute the
+layout on a graphics card.
 }

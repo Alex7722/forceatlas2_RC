@@ -440,6 +440,50 @@ static void attract_node(const fa2_state *s, double coef, int i)
     s->dy[i] = fy;
 }
 
+/* Adaptive global speed: the nodes go faster as long as they do not swing
+ * (change direction between two iterations) more than they travel. */
+void fa2_update_speed(int n, double total_swinging, double total_traction,
+                      double jitter_tolerance, double *speed_,
+                      double *speed_efficiency_)
+{
+    double speed = *speed_, speed_efficiency = *speed_efficiency_;
+
+    /* Nothing moves at all: keep the current speed. */
+    if (!(total_swinging > 0)) return;
+
+    const double est_jt = 0.05 * sqrt((double) n);
+    const double min_jt = sqrt(est_jt), max_jt = 10.0;
+    double jt = est_jt * total_traction / ((double) n * (double) n);
+    if (jt > max_jt) jt = max_jt;
+    if (jt < min_jt) jt = min_jt;
+    jt *= jitter_tolerance;
+
+    const double min_speed_efficiency = 0.05;
+
+    /* Protection against erratic behaviour */
+    if (total_swinging > 2.0 * total_traction) {
+        if (speed_efficiency > min_speed_efficiency) speed_efficiency *= 0.5;
+        if (jt < jitter_tolerance) jt = jitter_tolerance;
+    }
+
+    const double target_speed =
+        jt * speed_efficiency * total_traction / total_swinging;
+
+    if (total_swinging > jt * total_traction) {
+        if (speed_efficiency > min_speed_efficiency) speed_efficiency *= 0.7;
+    } else if (speed < 1000) {
+        speed_efficiency *= 1.3;
+    }
+
+    /* The speed may not rise by more than 50% per iteration. */
+    const double max_rise = 0.5;
+    const double rise = target_speed - speed;
+    speed += rise < max_rise * speed ? rise : max_rise * speed;
+
+    *speed_ = speed;
+    *speed_efficiency_ = speed_efficiency;
+}
+
 /* ------------------------------------------------------------------------ */
 /* Entry point                                                              */
 /* ------------------------------------------------------------------------ */
@@ -730,39 +774,8 @@ SEXP C_forceatlas2(SEXP n_, SEXP from_, SEXP to_, SEXP w_, SEXP pos_,
             total_traction += traction[i];
         }
 
-        if (total_swinging > 0) {
-            const double est_jt = 0.05 * sqrt((double) n);
-            const double min_jt = sqrt(est_jt), max_jt = 10.0;
-            double jt = est_jt * total_traction / ((double) n * (double) n);
-            if (jt > max_jt) jt = max_jt;
-            if (jt < min_jt) jt = min_jt;
-            jt *= jitter_tolerance;
-
-            const double min_speed_efficiency = 0.05;
-
-            /* Protection against erratic behaviour */
-            if (total_swinging > 2.0 * total_traction) {
-                if (speed_efficiency > min_speed_efficiency)
-                    speed_efficiency *= 0.5;
-                if (jt < jitter_tolerance) jt = jitter_tolerance;
-            }
-
-            const double target_speed =
-                jt * speed_efficiency * total_traction / total_swinging;
-
-            if (total_swinging > jt * total_traction) {
-                if (speed_efficiency > min_speed_efficiency)
-                    speed_efficiency *= 0.7;
-            } else if (speed < 1000) {
-                speed_efficiency *= 1.3;
-            }
-
-            /* The speed may not rise by more than 50% per iteration. */
-            const double max_rise = 0.5;
-            const double rise = target_speed - speed;
-            speed += rise < max_rise * speed ? rise : max_rise * speed;
-        }
-        /* else: nothing moves at all; keep the current speed. */
+        fa2_update_speed(n, total_swinging, total_traction, jitter_tolerance,
+                         &speed, &speed_efficiency);
 
         /* Apply the forces */
 #ifdef _OPENMP
@@ -806,6 +819,126 @@ SEXP C_forceatlas2(SEXP n_, SEXP from_, SEXP to_, SEXP w_, SEXP pos_,
     REAL(times)[4] = gpu_times[1];
     REAL(times)[5] = gpu_times[2];
     REAL(times)[6] = REAL(times)[0] - time_tree - time_repulsion;
+    setAttrib(times, R_NamesSymbol, names);
+    setAttrib(ans, install("timings"), times);
+
+    UNPROTECT(3);
+    return ans;
+}
+
+/*
+ * The all-GPU layout. The arguments are those of C_forceatlas2, except:
+ * flags_      c(strong gravity, linlog, outbound distribution, adjust sizes)
+ * gpu_        c(device, double precision, profile)
+ * source_     source of the OpenCL kernels
+ */
+SEXP C_forceatlas2_large(SEXP n_, SEXP from_, SEXP to_, SEXP w_, SEXP pos_,
+                         SEXP size_, SEXP fixed_, SEXP iter_, SEXP dpar_,
+                         SEXP flags_, SEXP gpu_, SEXP source_)
+{
+    const int n = asInteger(n_);
+    const int m = LENGTH(from_);
+    const int iterations = asInteger(iter_);
+
+    if (n == NA_INTEGER || n < 2) error("invalid number of nodes");
+    if (!isInteger(from_) || !isInteger(to_) || LENGTH(to_) != m)
+        error("invalid edge list");
+    if (!isReal(w_) || LENGTH(w_) != m) error("invalid edge weights");
+    if (!isReal(pos_) || XLENGTH(pos_) != 2 * (R_xlen_t) n)
+        error("invalid initial positions");
+    if (!isReal(size_) || LENGTH(size_) != n) error("invalid node sizes");
+    if (!isLogical(fixed_) || LENGTH(fixed_) != n)
+        error("invalid 'fixed' vector");
+    if (!isReal(dpar_) || LENGTH(dpar_) != 4) error("invalid parameters");
+    if (!isLogical(flags_) || LENGTH(flags_) != 4) error("invalid flags");
+    if (!isInteger(gpu_) || LENGTH(gpu_) != 3) error("invalid GPU settings");
+    if (!isString(source_) || LENGTH(source_) != 1)
+        error("invalid kernel source");
+    if (iterations == NA_INTEGER || iterations < 0)
+        error("invalid number of iterations");
+    if (m > (1 << 30) - 1) error("too many edges");
+
+    const int *from = INTEGER(from_), *to = INTEGER(to_);
+    for (int e = 0; e < m; e++)
+        if (from[e] < 0 || from[e] >= n || to[e] < 0 || to[e] >= n)
+            error("edge %d refers to a node that does not exist", e + 1);
+
+    SEXP ans = PROTECT(duplicate(pos_));
+    const int outbound = LOGICAL(flags_)[2];
+    const double *w = REAL(w_);
+
+    /* As in Gephi, the mass of a node is its degree plus one. */
+    double *mass = (double *) R_alloc(n, sizeof(double));
+    double mean_mass = 0.0;
+    for (int i = 0; i < n; i++) mass[i] = 1.0;
+    for (int e = 0; e < m; e++) {
+        mass[from[e]] += 1.0;
+        mass[to[e]] += 1.0;
+    }
+    for (int i = 0; i < n; i++) mean_mass += mass[i];
+    mean_mass /= n;
+    const double coef = outbound ? mean_mass : 1.0;
+
+    /* The edges of each node (self-loops have no effect). */
+    int *off = (int *) R_alloc((size_t) n + 1, sizeof(int));
+    int *inc_node = (int *) R_alloc(2 * (size_t) m + 1, sizeof(int));
+    double *inc_coef = (double *) R_alloc(2 * (size_t) m + 1, sizeof(double));
+    memset(off, 0, ((size_t) n + 1) * sizeof(int));
+    for (int e = 0; e < m; e++) {
+        if (from[e] == to[e]) continue;
+        off[from[e] + 1]++;
+        off[to[e] + 1]++;
+    }
+    for (int i = 0; i < n; i++) off[i + 1] += off[i];
+    for (int e = 0; e < m; e++) {
+        if (from[e] == to[e]) continue;
+        const double c = outbound ? coef * w[e] / mass[from[e]] : coef * w[e];
+        inc_node[off[from[e]]] = to[e];
+        inc_coef[off[from[e]]++] = c;
+        inc_node[off[to[e]]] = from[e];
+        inc_coef[off[to[e]]++] = c;
+    }
+    for (int i = n; i > 0; i--) off[i] = off[i - 1];
+    off[0] = 0;
+
+    fa2_full_params p;
+    memset(&p, 0, sizeof(p));
+    p.n = n;
+    p.inc_off = off;
+    p.inc_node = inc_node;
+    p.inc_coef = inc_coef;
+    p.mass = mass;
+    p.size = REAL(size_);
+    p.fixed = LOGICAL(fixed_);
+    for (int i = 0; i < n; i++)
+        if (p.fixed[i]) p.any_fixed = 1;
+    p.scaling = REAL(dpar_)[0];
+    p.gravity = REAL(dpar_)[1];
+    p.jitter_tolerance = REAL(dpar_)[2];
+    p.theta = REAL(dpar_)[3];
+    p.strong = LOGICAL(flags_)[0];
+    p.linlog = LOGICAL(flags_)[1];
+    p.adjust = LOGICAL(flags_)[3];
+    p.iterations = iterations;
+    p.device = INTEGER(gpu_)[0];
+    p.use_double = INTEGER(gpu_)[1] != 0;
+    p.profile = INTEGER(gpu_)[2] != 0;
+    p.source = CHAR(STRING_ELT(source_, 0));
+    p.interrupted = user_interrupted;
+
+    /* fa2_full_run() does not use R: it cannot be interrupted by an R error
+     * while it holds resources on the GPU. */
+    double t[FA2_FULL_NTIMES];
+    if (fa2_full_run(&p, REAL(ans), t)) error("%s", fa2_gpu_error());
+
+    const char *time_names[FA2_FULL_NTIMES] = {
+        "total", "codes", "sort", "tree", "repulsion", "attraction", "move"};
+    SEXP times = PROTECT(allocVector(REALSXP, FA2_FULL_NTIMES));
+    SEXP names = PROTECT(allocVector(STRSXP, FA2_FULL_NTIMES));
+    for (int i = 0; i < FA2_FULL_NTIMES; i++) {
+        REAL(times)[i] = t[i];
+        SET_STRING_ELT(names, i, mkChar(time_names[i]));
+    }
     setAttrib(times, R_NamesSymbol, names);
     setAttrib(ans, install("timings"), times);
 
@@ -862,6 +995,7 @@ SEXP C_has_openmp(void)
 
 static const R_CallMethodDef call_methods[] = {
     {"C_forceatlas2", (DL_FUNC) &C_forceatlas2, 12},
+    {"C_forceatlas2_large", (DL_FUNC) &C_forceatlas2_large, 12},
     {"C_gpu_devices", (DL_FUNC) &C_gpu_devices, 0},
     {"C_has_openmp", (DL_FUNC) &C_has_openmp, 0},
     {NULL, NULL, 0}};

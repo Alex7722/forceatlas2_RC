@@ -19,7 +19,7 @@
 #include <string.h>
 
 #include "fa2.h"
-#include "ocl.h"
+#include "gpu_internal.h"
 
 /* ------------------------------------------------------------------------ */
 /* Kernels                                                                  */
@@ -135,6 +135,13 @@ static void set_error(const char *what, cl_int code)
     snprintf(errbuf, sizeof(errbuf), "%s (OpenCL error %d)", what, (int) code);
 }
 
+void fa2_gpu_set_error(const char *what, cl_int code) { set_error(what, code); }
+
+void fa2_gpu_set_message(const char *message)
+{
+    snprintf(errbuf, sizeof(errbuf), "%s", message);
+}
+
 /* ------------------------------------------------------------------------ */
 /* Devices                                                                  */
 /* ------------------------------------------------------------------------ */
@@ -230,15 +237,19 @@ static struct {
     int device; /* -1: none */
     cl_context context;
     cl_command_queue queue;
-    cl_program program[2]; /* single, double precision */
-} cache = {-1, NULL, NULL, {NULL, NULL}};
+    /* [0]: the repulsion kernels of this file, [1]: the all-GPU pipeline of
+     * gpu_full.c; each in single and in double precision */
+    cl_program program[2][2];
+} cache = {-1, NULL, NULL, {{NULL, NULL}, {NULL, NULL}}};
 
 static void cache_release(void)
 {
     if (!cl) return;
     for (int i = 0; i < 2; i++) {
-        if (cache.program[i]) cl->ReleaseProgram(cache.program[i]);
-        cache.program[i] = NULL;
+        for (int j = 0; j < 2; j++) {
+            if (cache.program[i][j]) cl->ReleaseProgram(cache.program[i][j]);
+            cache.program[i][j] = NULL;
+        }
     }
     if (cache.queue) cl->ReleaseCommandQueue(cache.queue);
     if (cache.context) cl->ReleaseContext(cache.context);
@@ -255,7 +266,8 @@ void fa2_gpu_shutdown(void)
     ndevices = -1;
 }
 
-static int cache_prepare(int device, int use_double)
+static int cache_prepare(int device, int which, int use_double,
+                         const char *source)
 {
     cl_int err = CL_SUCCESS;
 
@@ -279,9 +291,10 @@ static int cache_prepare(int device, int use_double)
         cache.device = device;
     }
 
-    if (!cache.program[use_double]) {
-        cl_program prog = cl->CreateProgramWithSource(
-            cache.context, 1, (const char **) &kernel_source, NULL, &err);
+    if (!cache.program[which][use_double]) {
+        if (!which) source = kernel_source;
+        cl_program prog = cl->CreateProgramWithSource(cache.context, 1, &source,
+                                                      NULL, &err);
         if (!prog || err != CL_SUCCESS) {
             set_error("could not create the OpenCL program", err);
             return 1;
@@ -302,8 +315,38 @@ static int cache_prepare(int device, int use_double)
             cl->ReleaseProgram(prog);
             return 1;
         }
-        cache.program[use_double] = prog;
+        cache.program[which][use_double] = prog;
     }
+    return 0;
+}
+
+const fa2_cl_api *fa2_gpu_cl(void) { return cl; }
+
+int fa2_gpu_acquire(int device, int which, int use_double, const char *source,
+                    cl_context *context, cl_command_queue *queue,
+                    cl_program *program)
+{
+    if (device < 0 || device >= fa2_gpu_ndevices()) {
+        if (cl)
+            snprintf(errbuf, sizeof(errbuf), "there is no OpenCL device %d",
+                     device + 1);
+        return 1;
+    }
+    which = which ? 1 : 0;
+    use_double = use_double ? 1 : 0;
+    if (use_double) {
+        fa2_gpu_devinfo info;
+        fa2_gpu_device_info(device, &info);
+        if (!info.has_double) {
+            snprintf(errbuf, sizeof(errbuf),
+                     "this device does not support double precision");
+            return 1;
+        }
+    }
+    if (cache_prepare(device, which, use_double, source)) return 1;
+    *context = cache.context;
+    *queue = cache.queue;
+    *program = cache.program[which][use_double];
     return 0;
 }
 
@@ -371,7 +414,7 @@ fa2_gpu *fa2_gpu_open(int device, int use_double, int n, int adjust,
             return NULL;
         }
     }
-    if (cache_prepare(device, use_double)) return NULL;
+    if (cache_prepare(device, 0, use_double, NULL)) return NULL;
 
     fa2_gpu *g = (fa2_gpu *) calloc(1, sizeof(fa2_gpu));
     if (!g) {
@@ -398,7 +441,7 @@ fa2_gpu *fa2_gpu_open(int device, int use_double, int n, int adjust,
         if (!g->host_rr || !g->host_ri) goto nomem;
     }
 
-    g->kernel = cl->CreateKernel(cache.program[use_double],
+    g->kernel = cl->CreateKernel(cache.program[0][use_double],
                                  g->barnes_hut ? "fa2_bh" : "fa2_exact", &err);
     if (!g->kernel || err != CL_SUCCESS) {
         g->kernel = NULL;

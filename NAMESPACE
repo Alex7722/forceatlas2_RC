@@ -2,7 +2,9 @@
 
 export(forceatlas2)
 export(forceatlas2_gpu)
+export(forceatlas2_large)
 export(gpu_devices)
 export(layout_forceatlas2)
 export(layout_forceatlas2_gpu)
+export(layout_forceatlas2_large)
 useDynLib(forceatlas2r, .registration = TRUE)

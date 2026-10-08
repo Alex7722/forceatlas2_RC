@@ -112,7 +112,8 @@
 #'   effect if the package was compiled without OpenMP support (the default
 #'   toolchain on macOS), in which case a single thread is used.
 #'
-#' @seealso [forceatlas2_gpu()] to compute the layout on a graphics card.
+#' @seealso [forceatlas2_gpu()] and [forceatlas2_large()] to compute the
+#'   layout on a graphics card.
 #'
 #' @return
 #' `forceatlas2()` returns `graph`, of the same class as its input, with the
@@ -243,6 +244,8 @@ fa2_layout <- function(graph, iterations, scaling_ratio, gravity,
   }
   if (threads > 1 && !.Call(C_has_openmp)) threads <- 1
 
+  # The all-GPU layout needs at least two nodes: below, use the CPU.
+  if (isTRUE(gpu$full) && n < 2) gpu <- NULL
   gpu_settings <- c(-1L, 0L)
   if (!is.null(gpu)) {
     gpu_settings <- gpu_resolve(gpu$device, gpu$precision)
@@ -272,24 +275,43 @@ fa2_layout <- function(graph, iterations, scaling_ratio, gravity,
 
   el <- igraph::as_edgelist(graph, names = FALSE)
 
-  xy <- .Call(
-    C_forceatlas2,
-    as.integer(n),
-    as.integer(el[, 1L] - 1),
-    as.integer(el[, 2L] - 1),
-    as.double(w),
-    pos,
-    as.double(size),
-    fixed,
-    as.integer(iterations),
-    as.double(c(scaling_ratio, gravity, jitter_tolerance, theta)),
-    c(strong_gravity, linlog, dissuade_hubs, prevent_overlap, barnes_hut),
-    as.integer(threads),
-    gpu_settings
-  )
+  timings <- isTRUE(getOption("forceatlas2r.timings"))
+  if (isTRUE(gpu$full)) {
+    xy <- .Call(
+      C_forceatlas2_large,
+      as.integer(n),
+      as.integer(el[, 1L] - 1),
+      as.integer(el[, 2L] - 1),
+      as.double(w),
+      pos,
+      as.double(size),
+      fixed,
+      as.integer(iterations),
+      as.double(c(scaling_ratio, gravity, jitter_tolerance, theta)),
+      c(strong_gravity, linlog, dissuade_hubs, prevent_overlap),
+      c(gpu_settings, as.integer(timings)),
+      pipeline_source()
+    )
+  } else {
+    xy <- .Call(
+      C_forceatlas2,
+      as.integer(n),
+      as.integer(el[, 1L] - 1),
+      as.integer(el[, 2L] - 1),
+      as.double(w),
+      pos,
+      as.double(size),
+      fixed,
+      as.integer(iterations),
+      as.double(c(scaling_ratio, gravity, jitter_tolerance, theta)),
+      c(strong_gravity, linlog, dissuade_hubs, prevent_overlap, barnes_hut),
+      as.integer(threads),
+      gpu_settings
+    )
+  }
   dimnames(xy) <- NULL
   # Where the time went: kept only on request, see ?forceatlas2_gpu.
-  if (!isTRUE(getOption("forceatlas2r.timings"))) attr(xy, "timings") <- NULL
+  if (!timings) attr(xy, "timings") <- NULL
   xy
 }
 

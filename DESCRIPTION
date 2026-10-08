@@ -1,6 +1,6 @@
 Package: forceatlas2r
 Title: Fast 'ForceAtlas2' Graph Layout for 'tidygraph' and 'igraph'
-Version: 0.2.2
+Version: 0.3.0
 Authors@R: c(
     person("Your", "Name", email = "you@example.com", role = c("aut", "cre")),
     person("Mathieu", "Jacomy", role = "ctb",
@@ -15,8 +15,9 @@ Description: A compiled (C) implementation of the 'ForceAtlas2' graph layout
     Barnes-Hut approximation and optional multithreading. The layout can be
     added directly to the node table of a 'tidygraph' graph, or computed as a
     coordinate matrix for 'igraph' and 'ggraph'. The layout can also be
-    computed on a graphics card through 'OpenCL', which is loaded at run time
-    and is not needed to install the package.
+    computed on a graphics card through 'OpenCL', partly or entirely (for
+    very large graphs); 'OpenCL' is loaded at run time and is not needed to
+    install the package.
 License: GPL (>= 3)
 Encoding: UTF-8
 Depends: R (>= 3.5.0)

@@ -72,7 +72,8 @@
 #' `double` precision. It has no rows when no device is available.
 #'
 #' @seealso [forceatlas2()] for the description of the algorithm and of its
-#'   settings.
+#'   settings; [forceatlas2_large()], which runs entirely on the GPU, for very
+#'   large graphs.
 #'
 #' @examples
 #' gpu_devices()
