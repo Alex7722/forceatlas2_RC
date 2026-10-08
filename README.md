@@ -135,6 +135,8 @@ OpenCL should work too.
   same layout as the CPU, more slowly on most cards.
 * A GPU only pays off for large graphs: for a few thousand nodes, the CPU
   version is as fast.
+* For large graphs, set `threads` to the number of cores of the computer: the
+  tree is built on the CPU, and that is what limits the speed.
 
 ## Differences with Gephi
 

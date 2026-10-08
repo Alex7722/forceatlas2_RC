@@ -72,11 +72,24 @@ static void region_init(fa2_region *r, const int *perm, const double *x,
     }
 }
 
+/* Quadrant of node i around the point (cx, cy). */
+#define FA2_QUADRANT(i) ((x[i] < cx ? 0 : 2) + (y[i] < cy ? 0 : 1))
+
+/*
+ * The tree is built breadth first, one level at a time: there is no
+ * recursion, hence no risk of exhausting the C stack on degenerate (very
+ * deep) trees. The regions of a level cover separate sets of nodes, so they
+ * are processed in parallel; the tree does not depend on the number of
+ * threads.
+ */
 static void tree_build(fa2_tree *t, int n, const double *x, const double *y,
-                       const double *mass, const double *size)
+                       const double *mass, const double *size, int threads)
 {
-    int *perm = t->perm, *tmp = t->tmp;
+    int *perm = t->perm, *tmp = t->tmp, *cnts = t->cnt;
     fa2_region *reg = t->reg;
+#ifndef _OPENMP
+    (void) threads;
+#endif
 
     for (int i = 0; i < n; i++) perm[i] = i;
     reg[0].start = 0;
@@ -85,61 +98,87 @@ static void tree_build(fa2_tree *t, int n, const double *x, const double *y,
     region_init(&reg[0], perm, x, y, mass);
     t->nreg = 1;
 
-    /* Breadth-first construction: no recursion, so no risk of exhausting the
-     * C stack on degenerate (very deep) trees. */
-    for (int r = 0; r < t->nreg; r++) {
-        const int start = reg[r].start, count = reg[r].count;
-        if (count <= FA2_LEAF_SIZE) continue;
+    int lo = 0, hi = 1; /* the regions of the current level */
+    while (lo < hi) {
+#ifdef _OPENMP
+        int chunk = (hi - lo) / (8 * threads);
+        if (chunk < 1) chunk = 1;
+#endif
 
-        const double cx = reg[r].cx, cy = reg[r].cy;
-        const int end = start + count;
-        int cnt[4] = {0, 0, 0, 0}, off[4];
+        /* 1. Split the nodes of each region between its four quadrants. */
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(threads) schedule(dynamic, chunk) if (threads > 1 && hi - lo > 1)
+#endif
+        for (int r = lo; r < hi; r++) {
+            const int start = reg[r].start, count = reg[r].count;
+            int *cnt = cnts + 4 * (size_t) (r - lo);
+            cnt[0] = cnt[1] = cnt[2] = cnt[3] = 0;
+            if (count <= FA2_LEAF_SIZE) continue;
 
-        for (int k = start; k < end; k++) {
-            const int i = perm[k];
-            cnt[(x[i] < cx ? 0 : 2) + (y[i] < cy ? 0 : 1)]++;
-        }
+            const double cx = reg[r].cx, cy = reg[r].cy;
+            const int end = start + count;
+            for (int k = start; k < end; k++) cnt[FA2_QUADRANT(perm[k])]++;
 
-        reg[r].child = t->nreg;
-        if (cnt[0] == count || cnt[1] == count || cnt[2] == count ||
-            cnt[3] == count) {
-            /* All the nodes fall in the same quadrant (coincident nodes):
-             * make each of them a leaf. */
-            reg[r].nchild = count;
-            for (int k = start; k < end; k++) {
-                const int idx = t->nreg++;
-                fa2_region *c = &reg[idx];
-                c->start = k;
-                c->count = 1;
-                c->skip = idx == reg[r].child ? reg[r].skip : idx - 1;
-                region_init(c, perm, x, y, mass);
-            }
-            continue;
-        }
+            /* All the nodes in the same quadrant (coincident nodes): there
+             * is nothing to reorder, each node will become a leaf. */
+            if (cnt[0] == count || cnt[1] == count || cnt[2] == count ||
+                cnt[3] == count)
+                continue;
 
-        off[0] = start;
-        for (int q = 1; q < 4; q++) off[q] = off[q - 1] + cnt[q - 1];
-        {
-            int pos[4] = {off[0], off[1], off[2], off[3]};
+            int pos[4];
+            pos[0] = start;
+            for (int q = 1; q < 4; q++) pos[q] = pos[q - 1] + cnt[q - 1];
             for (int k = start; k < end; k++) {
                 const int i = perm[k];
-                tmp[pos[(x[i] < cx ? 0 : 2) + (y[i] < cy ? 0 : 1)]++] = i;
+                tmp[pos[FA2_QUADRANT(i)]++] = i;
+            }
+            memcpy(perm + start, tmp + start, (size_t) count * sizeof(int));
+        }
+
+        /* 2. Create the regions of the next level, in order. */
+        for (int r = lo; r < hi; r++) {
+            const int start = reg[r].start, count = reg[r].count;
+            const int *cnt = cnts + 4 * (size_t) (r - lo);
+            if (count <= FA2_LEAF_SIZE) continue;
+
+            reg[r].child = t->nreg;
+            if (cnt[0] == count || cnt[1] == count || cnt[2] == count ||
+                cnt[3] == count) {
+                reg[r].nchild = count;
+                for (int k = start; k < start + count; k++) {
+                    const int idx = t->nreg++;
+                    reg[idx].start = k;
+                    reg[idx].count = 1;
+                    reg[idx].skip = idx == reg[r].child ? reg[r].skip : idx - 1;
+                }
+                continue;
+            }
+            int off = start;
+            for (int q = 0; q < 4; q++) {
+                if (cnt[q] == 0) continue;
+                const int idx = t->nreg++;
+                reg[idx].start = off;
+                reg[idx].count = cnt[q];
+                reg[idx].skip = idx == reg[r].child ? reg[r].skip : idx - 1;
+                reg[r].nchild++;
+                off += cnt[q];
             }
         }
-        memcpy(perm + start, tmp + start, (size_t) count * sizeof(int));
 
-        for (int q = 0; q < 4; q++) {
-            if (cnt[q] == 0) continue;
-            const int idx = t->nreg++;
-            fa2_region *c = &reg[idx];
-            c->start = off[q];
-            c->count = cnt[q];
-            c->skip = idx == reg[r].child ? reg[r].skip : idx - 1;
-            region_init(c, perm, x, y, mass);
-            reg[r].nchild++;
-        }
+        /* 3. Compute their mass, centre and size. */
+        lo = hi;
+        hi = t->nreg;
+#ifdef _OPENMP
+        chunk = (hi - lo) / (8 * threads);
+        if (chunk < 1) chunk = 1;
+#pragma omp parallel for num_threads(threads) schedule(dynamic, chunk) if (threads > 1 && hi - lo > 1)
+#endif
+        for (int r = lo; r < hi; r++) region_init(&reg[r], perm, x, y, mass);
     }
 
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(threads) schedule(static) if (threads > 1)
+#endif
     for (int k = 0; k < n; k++) {
         const int i = perm[k];
         t->px[k] = x[i];
@@ -439,6 +478,7 @@ SEXP C_forceatlas2(SEXP n_, SEXP from_, SEXP to_, SEXP w_, SEXP pos_,
         tree.reg = (fa2_region *) R_alloc(stack_len, sizeof(fa2_region));
         tree.perm = (int *) R_alloc(n, sizeof(int));
         tree.tmp = (int *) R_alloc(n, sizeof(int));
+        tree.cnt = (int *) R_alloc(4 * (size_t) n, sizeof(int));
         tree.px = (double *) R_alloc(n, sizeof(double));
         tree.py = (double *) R_alloc(n, sizeof(double));
         tree.pm = (double *) R_alloc(n, sizeof(double));
@@ -450,13 +490,16 @@ SEXP C_forceatlas2(SEXP n_, SEXP from_, SEXP to_, SEXP w_, SEXP pos_,
     /* From here on, no R error may be raised while `gpu` is open. */
     fa2_gpu *gpu = NULL;
     if (gpu_device >= 0) {
-        gpu = fa2_gpu_open(gpu_device, gpu_double, n, s.adjust, barnes_hut);
+        gpu = fa2_gpu_open(gpu_device, gpu_double, n, s.adjust, barnes_hut,
+                           threads);
         if (!gpu) error("%s", fa2_gpu_error());
     }
 
     const double attraction_coef = s.outbound ? mean_mass : 1.0;
     double speed = 1.0, speed_efficiency = 1.0;
     double work = 0.0;
+    double time_tree = 0.0, time_repulsion = 0.0;
+    const double time_start = fa2_now();
 
     for (int it = 0; it < iterations; it++) {
         /* Let the user interrupt long computations. */
@@ -479,23 +522,26 @@ SEXP C_forceatlas2(SEXP n_, SEXP from_, SEXP to_, SEXP w_, SEXP pos_,
         memset(s.dy, 0, (size_t) n * sizeof(double));
 
         /* Repulsion */
+        double t0 = fa2_now(), t1;
+        if (barnes_hut) {
+            tree_build(&tree, n, s.x, s.y, mass, s.adjust ? s.size : NULL,
+                       threads);
+            t1 = fa2_now();
+            time_tree += t1 - t0;
+            t0 = t1;
+        }
         if (gpu) {
-            int failed;
-            if (barnes_hut) {
-                tree_build(&tree, n, s.x, s.y, mass, s.adjust ? s.size : NULL);
-                failed = fa2_gpu_repulse_bh(gpu, &tree, s.scaling, s.theta,
-                                            s.dx, s.dy);
-            } else {
-                failed = fa2_gpu_repulse_exact(gpu, s.x, s.y, mass,
-                                               s.adjust ? s.size : NULL,
-                                               s.scaling, s.dx, s.dy);
-            }
+            const int failed =
+                barnes_hut ? fa2_gpu_repulse_bh(gpu, &tree, s.scaling, s.theta,
+                                                s.dx, s.dy)
+                           : fa2_gpu_repulse_exact(gpu, s.x, s.y, mass,
+                                                   s.adjust ? s.size : NULL,
+                                                   s.scaling, s.dx, s.dy);
             if (failed) {
                 fa2_gpu_close(gpu);
                 error("%s", fa2_gpu_error());
             }
         } else if (barnes_hut) {
-            tree_build(&tree, n, s.x, s.y, mass, s.adjust ? s.size : NULL);
             /* Nodes are visited in the order of the tree: consecutive nodes
              * are neighbours in space and traverse the same regions, which
              * makes a much better use of the CPU caches. */
@@ -518,6 +564,7 @@ SEXP C_forceatlas2(SEXP n_, SEXP from_, SEXP to_, SEXP w_, SEXP pos_,
         } else {
             repulse_all_exact_symmetric(&s);
         }
+        time_repulsion += fa2_now() - t0;
 
         /* Gravity */
         if (s.gravity != 0)
@@ -594,8 +641,27 @@ SEXP C_forceatlas2(SEXP n_, SEXP from_, SEXP to_, SEXP w_, SEXP pos_,
         }
     }
 
+    /* Where the time went, in seconds, for diagnostic purposes. */
+    double gpu_times[3] = {0.0, 0.0, 0.0};
+    if (gpu) fa2_gpu_times(gpu, gpu_times);
     fa2_gpu_close(gpu);
-    UNPROTECT(1);
+
+    const char *time_names[] = {"total", "tree", "repulsion", "gpu_send",
+                                "gpu_compute", "gpu_fetch", "other"};
+    SEXP times = PROTECT(allocVector(REALSXP, 7));
+    SEXP names = PROTECT(allocVector(STRSXP, 7));
+    for (int i = 0; i < 7; i++) SET_STRING_ELT(names, i, mkChar(time_names[i]));
+    REAL(times)[0] = fa2_now() - time_start;
+    REAL(times)[1] = time_tree;
+    REAL(times)[2] = time_repulsion;
+    REAL(times)[3] = gpu_times[0];
+    REAL(times)[4] = gpu_times[1];
+    REAL(times)[5] = gpu_times[2];
+    REAL(times)[6] = REAL(times)[0] - time_tree - time_repulsion;
+    setAttrib(times, R_NamesSymbol, names);
+    setAttrib(ans, install("timings"), times);
+
+    UNPROTECT(3);
     return ans;
 }
 

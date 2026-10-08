@@ -288,6 +288,8 @@ fa2_layout <- function(graph, iterations, scaling_ratio, gravity,
     gpu_settings
   )
   dimnames(xy) <- NULL
+  # Where the time went: kept only on request, see ?forceatlas2_gpu.
+  if (!isTRUE(getOption("forceatlas2r.timings"))) attr(xy, "timings") <- NULL
   xy
 }
 

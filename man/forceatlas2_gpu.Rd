@@ -25,6 +25,7 @@ forceatlas2_gpu(
   jitter_tolerance = 1,
   barnes_hut = NULL,
   theta = 1.2,
+  threads = 1,
   device = NULL,
   precision = c("single", "double"),
   coords = c("x", "y")
@@ -49,6 +50,7 @@ layout_forceatlas2_gpu(
   jitter_tolerance = 1,
   barnes_hut = NULL,
   theta = 1.2,
+  threads = 1,
   device = NULL,
   precision = c("single", "double")
 )
@@ -122,6 +124,12 @@ algorithm. \code{NULL} (the default) enables it for graphs with at least
 \item{theta}{Precision of the Barnes-Hut approximation: smaller values are
 more precise and slower.}
 
+\item{threads}{Number of CPU threads used for the part of the work that
+stays on the CPU: building the Barnes-Hut tree and exchanging data with
+the card. For large graphs this is what limits the speed, so it is worth
+setting it to the number of cores of the computer. It has no effect if
+the package was compiled without OpenMP support.}
+
 \item{device}{The device to use, as its row number in \code{gpu_devices()}.
 \code{NULL} (the default) uses the first GPU, giving priority to NVIDIA cards.}
 
@@ -181,6 +189,13 @@ A GPU only pays off for large graphs. For a few thousand nodes the CPU
 version is as fast or faster, because each iteration has a fixed cost of
 exchanging data with the card. The first GPU layout of a session also
 takes a moment longer, while the driver compiles the code for the card.
+
+To see where the time goes, set \code{options(forceatlas2r.timings = TRUE)}:
+the matrix returned by \code{layout_forceatlas2_gpu()} (and by
+\code{\link[=layout_forceatlas2]{layout_forceatlas2()}}) then has a \code{"timings"} attribute, giving in seconds
+the total time, the time spent building the tree, the time spent on the
+repulsion (of which sending data to the card, computing on it and fetching
+the result) and the rest.
 }
 \examples{
 gpu_devices()

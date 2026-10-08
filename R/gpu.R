@@ -40,10 +40,22 @@
 #' exchanging data with the card. The first GPU layout of a session also
 #' takes a moment longer, while the driver compiles the code for the card.
 #'
+#' To see where the time goes, set `options(forceatlas2r.timings = TRUE)`:
+#' the matrix returned by `layout_forceatlas2_gpu()` (and by
+#' [layout_forceatlas2()]) then has a `"timings"` attribute, giving in seconds
+#' the total time, the time spent building the tree, the time spent on the
+#' repulsion (of which sending data to the card, computing on it and fetching
+#' the result) and the rest.
+#'
 #' @inheritParams forceatlas2
 #' @param barnes_hut Whether to approximate the repulsion with the Barnes-Hut
 #'   algorithm. `NULL` (the default) enables it for graphs with at least
 #'   10,000 nodes.
+#' @param threads Number of CPU threads used for the part of the work that
+#'   stays on the CPU: building the Barnes-Hut tree and exchanging data with
+#'   the card. For large graphs this is what limits the speed, so it is worth
+#'   setting it to the number of cores of the computer. It has no effect if
+#'   the package was compiled without OpenMP support.
 #' @param device The device to use, as its row number in `gpu_devices()`.
 #'   `NULL` (the default) uses the first GPU, giving priority to NVIDIA cards.
 #' @param precision `"single"` (the default) or `"double"`: the precision of
@@ -79,8 +91,8 @@ forceatlas2_gpu <- function(graph, iterations = 1000, scaling_ratio = NULL,
                             weights = NULL, edge_weight_influence = 1,
                             normalize_weights = FALSE, invert_weights = FALSE,
                             init = NULL, fixed = NULL, jitter_tolerance = 1,
-                            barnes_hut = NULL, theta = 1.2, device = NULL,
-                            precision = c("single", "double"),
+                            barnes_hut = NULL, theta = 1.2, threads = 1,
+                            device = NULL, precision = c("single", "double"),
                             coords = c("x", "y")) {
   coords <- check_coords(coords)
   xy <- layout_forceatlas2_gpu(
@@ -91,8 +103,8 @@ forceatlas2_gpu <- function(graph, iterations = 1000, scaling_ratio = NULL,
     edge_weight_influence = edge_weight_influence,
     normalize_weights = normalize_weights, invert_weights = invert_weights,
     init = init, fixed = fixed, jitter_tolerance = jitter_tolerance,
-    barnes_hut = barnes_hut, theta = theta, device = device,
-    precision = precision
+    barnes_hut = barnes_hut, theta = theta, threads = threads,
+    device = device, precision = precision
   )
   set_coords(graph, xy, coords)
 }
@@ -109,7 +121,7 @@ layout_forceatlas2_gpu <- function(graph, iterations = 1000,
                                    invert_weights = FALSE, init = NULL,
                                    fixed = NULL, jitter_tolerance = 1,
                                    barnes_hut = NULL, theta = 1.2,
-                                   device = NULL,
+                                   threads = 1, device = NULL,
                                    precision = c("single", "double")) {
   precision <- match.arg(precision)
   fa2_layout(
@@ -120,7 +132,7 @@ layout_forceatlas2_gpu <- function(graph, iterations = 1000,
     edge_weight_influence = edge_weight_influence,
     normalize_weights = normalize_weights, invert_weights = invert_weights,
     init = init, fixed = fixed, jitter_tolerance = jitter_tolerance,
-    barnes_hut = barnes_hut, theta = theta,
+    barnes_hut = barnes_hut, theta = theta, threads = threads,
     gpu = list(device = device, precision = precision)
   )
 }

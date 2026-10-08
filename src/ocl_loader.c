@@ -1,8 +1,11 @@
 /*
- * Run-time binding of the OpenCL library. This file must not include any R
- * header (they clash with <windows.h>).
+ * The parts that depend on the operating system: run-time binding of the
+ * OpenCL library, and a clock. This file must not include any R header (they
+ * clash with <windows.h>).
  */
 #include "ocl.h"
+
+double fa2_now(void);
 
 #ifdef _WIN32
 #include <windows.h>
@@ -21,8 +24,17 @@ static void *lib_symbol(fa2_lib lib, const char *name)
     return (void *) GetProcAddress(lib, name);
 }
 static void lib_close(fa2_lib lib) { FreeLibrary(lib); }
+
+double fa2_now(void)
+{
+    LARGE_INTEGER count, freq;
+    QueryPerformanceCounter(&count);
+    QueryPerformanceFrequency(&freq);
+    return (double) count.QuadPart / (double) freq.QuadPart;
+}
 #else
 #include <dlfcn.h>
+#include <time.h>
 typedef void *fa2_lib;
 static fa2_lib lib_open(void)
 {
@@ -44,6 +56,13 @@ static void *lib_symbol(fa2_lib lib, const char *name)
     return dlsym(lib, name);
 }
 static void lib_close(fa2_lib lib) { dlclose(lib); }
+
+double fa2_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double) ts.tv_sec + 1e-9 * (double) ts.tv_nsec;
+}
 #endif
 
 static fa2_lib the_lib = NULL;

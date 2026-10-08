@@ -30,6 +30,7 @@ typedef struct {
     int nreg;
     int *perm; /* node indices, grouped by region */
     int *tmp;  /* scratch space for partitioning */
+    int *cnt;  /* scratch space: nodes per quadrant, for a level of the tree */
     /* Positions, masses and radii of the nodes in the order of perm, so that
      * the nodes of a region are contiguous in memory. */
     double *px, *py, *pm, *ps;
@@ -60,8 +61,12 @@ int fa2_gpu_ndevices(void);
 int fa2_gpu_device_info(int idx, fa2_gpu_devinfo *info);
 
 /* Prepare device `device` for a layout of n nodes; NULL on error. */
+/* `threads` is the number of CPU threads used to prepare the data. */
 fa2_gpu *fa2_gpu_open(int device, int use_double, int n, int adjust,
-                      int barnes_hut);
+                      int barnes_hut, int threads);
+/* Time spent, in seconds, since the device was opened: sending the data,
+ * computing on the device, and fetching the result. */
+void fa2_gpu_times(const fa2_gpu *g, double times[3]);
 void fa2_gpu_close(fa2_gpu *g);
 
 /* Both add the repulsion forces to dx and dy and return 0 on success. `size`
@@ -74,5 +79,8 @@ int fa2_gpu_repulse_bh(fa2_gpu *g, const fa2_tree *t, double scaling,
 
 /* Release everything that is cached between calls. */
 void fa2_gpu_shutdown(void);
+
+/* A monotonic clock, in seconds (ocl_loader.c). */
+double fa2_now(void);
 
 #endif

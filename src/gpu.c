@@ -312,7 +312,8 @@ static int cache_prepare(int device, int use_double)
 /* ------------------------------------------------------------------------ */
 
 struct fa2_gpu {
-    int n, use_double, adjust, barnes_hut;
+    int n, use_double, adjust, barnes_hut, threads;
+    double t_send, t_compute, t_fetch;
     size_t real_size;
     cl_kernel kernel;
     cl_mem buf_p, buf_f, buf_rr, buf_ri;
@@ -339,8 +340,15 @@ void fa2_gpu_close(fa2_gpu *g)
     free(g);
 }
 
+void fa2_gpu_times(const fa2_gpu *g, double times[3])
+{
+    times[0] = g->t_send;
+    times[1] = g->t_compute;
+    times[2] = g->t_fetch;
+}
+
 fa2_gpu *fa2_gpu_open(int device, int use_double, int n, int adjust,
-                      int barnes_hut)
+                      int barnes_hut, int threads)
 {
     if (device < 0 || device >= fa2_gpu_ndevices()) {
         if (cl)
@@ -374,6 +382,7 @@ fa2_gpu *fa2_gpu_open(int device, int use_double, int n, int adjust,
     g->use_double = use_double;
     g->adjust = adjust ? 1 : 0;
     g->barnes_hut = barnes_hut ? 1 : 0;
+    g->threads = threads > 1 ? threads : 1;
     g->real_size = use_double ? sizeof(double) : sizeof(float);
 
     const size_t nn = (size_t) n;
@@ -422,19 +431,91 @@ fail:
     return NULL;
 }
 
-/* Store a double in element i of an array of the device's real type. */
-static inline void put_real(const fa2_gpu *g, void *array, size_t i, double v)
+/* The loops that convert between the doubles of the CPU and the reals of the
+ * device are written for both types with this macro. They run in parallel:
+ * for large graphs they would otherwise take longer than the GPU itself. */
+#ifdef _OPENMP
+#define FA2_PARALLEL_FOR                                                      \
+    _Pragma("omp parallel for num_threads(g->threads) schedule(static) if (g->threads > 1)")
+#else
+#define FA2_PARALLEL_FOR
+#endif
+
+#define DEFINE_CONVERTERS(REAL, SUFFIX)                                       \
+    static void nodes_to_device_##SUFFIX(const fa2_gpu *g, const double *x,   \
+                                         const double *y, const double *mass, \
+                                         const double *size)                  \
+    {                                                                         \
+        REAL *p = (REAL *) g->host_p;                                         \
+        FA2_PARALLEL_FOR                                                      \
+        for (int i = 0; i < g->n; i++) {                                      \
+            p[4 * i] = (REAL) x[i];                                           \
+            p[4 * i + 1] = (REAL) y[i];                                       \
+            p[4 * i + 2] = (REAL) mass[i];                                    \
+            p[4 * i + 3] = size ? (REAL) size[i] : (REAL) 0;                  \
+        }                                                                     \
+    }                                                                         \
+    static void regions_to_device_##SUFFIX(const fa2_gpu *g,                  \
+                                           const fa2_tree *t)                 \
+    {                                                                         \
+        REAL *rr = (REAL *) g->host_rr;                                       \
+        int *ri = g->host_ri;                                                 \
+        FA2_PARALLEL_FOR                                                      \
+        for (int r = 0; r < t->nreg; r++) {                                   \
+            const fa2_region *reg = &t->reg[r];                               \
+            rr[4 * r] = (REAL) reg->cx;                                       \
+            rr[4 * r + 1] = (REAL) reg->cy;                                   \
+            rr[4 * r + 2] = (REAL) reg->mass;                                 \
+            rr[4 * r + 3] = (REAL) (reg->size * reg->size);                   \
+            ri[4 * r] = reg->start;                                           \
+            ri[4 * r + 1] = reg->count;                                       \
+            ri[4 * r + 2] =                                                   \
+                reg->nchild > 0 ? reg->child + reg->nchild - 1 : -1;          \
+            ri[4 * r + 3] = reg->skip;                                        \
+        }                                                                     \
+    }                                                                         \
+    /* perm[k] is the node that element k of the result belongs to (NULL:    \
+     * node k). It is a permutation, so the iterations are independent. */   \
+    static void forces_from_device_##SUFFIX(const fa2_gpu *g,                 \
+                                            const int *perm, double *dx,      \
+                                            double *dy)                       \
+    {                                                                         \
+        const REAL *f = (const REAL *) g->host_f;                             \
+        FA2_PARALLEL_FOR                                                      \
+        for (int k = 0; k < g->n; k++) {                                      \
+            const int i = perm ? perm[k] : k;                                 \
+            dx[i] += (double) f[2 * k];                                       \
+            dy[i] += (double) f[2 * k + 1];                                   \
+        }                                                                     \
+    }
+
+DEFINE_CONVERTERS(float, single)
+DEFINE_CONVERTERS(double, double)
+
+static void nodes_to_device(const fa2_gpu *g, const double *x, const double *y,
+                            const double *mass, const double *size)
 {
     if (g->use_double)
-        ((double *) array)[i] = v;
+        nodes_to_device_double(g, x, y, mass, size);
     else
-        ((float *) array)[i] = (float) v;
+        nodes_to_device_single(g, x, y, mass, size);
 }
 
-static inline double get_real(const fa2_gpu *g, const void *array, size_t i)
+static void regions_to_device(const fa2_gpu *g, const fa2_tree *t)
 {
-    return g->use_double ? ((const double *) array)[i]
-                         : (double) ((const float *) array)[i];
+    if (g->use_double)
+        regions_to_device_double(g, t);
+    else
+        regions_to_device_single(g, t);
+}
+
+static void forces_from_device(const fa2_gpu *g, const int *perm, double *dx,
+                               double *dy)
+{
+    if (g->use_double)
+        forces_from_device_double(g, perm, dx, dy);
+    else
+        forces_from_device_single(g, perm, dx, dy);
 }
 
 static cl_int set_arg_real(const fa2_gpu *g, cl_uint idx, double v)
@@ -462,16 +543,15 @@ int fa2_gpu_repulse_exact(fa2_gpu *g, const double *x, const double *y,
     const size_t n = (size_t) g->n;
     cl_int err = CL_SUCCESS;
 
-    for (size_t i = 0; i < n; i++) {
-        put_real(g, g->host_p, 4 * i, x[i]);
-        put_real(g, g->host_p, 4 * i + 1, y[i]);
-        put_real(g, g->host_p, 4 * i + 2, mass[i]);
-        put_real(g, g->host_p, 4 * i + 3, size ? size[i] : 0.0);
-    }
+    double t0 = fa2_now(), t1;
+    nodes_to_device(g, x, y, mass, size);
     err = cl->EnqueueWriteBuffer(cache.queue, g->buf_p, CL_TRUE, 0,
                                  4 * n * g->real_size, g->host_p, 0, NULL,
                                  NULL);
     if (err != CL_SUCCESS) goto fail;
+    t1 = fa2_now();
+    g->t_send += t1 - t0;
+    t0 = t1;
 
     err = set_arg_int(g, 0, g->n);
     if (!err) err = set_arg_real(g, 3, scaling);
@@ -495,14 +575,17 @@ int fa2_gpu_repulse_exact(fa2_gpu *g, const double *x, const double *y,
         cl->Flush(cache.queue);
     }
 
+    err = cl->Finish(cache.queue);
+    if (err != CL_SUCCESS) goto fail;
+    t1 = fa2_now();
+    g->t_compute += t1 - t0;
+    t0 = t1;
+
     err = cl->EnqueueReadBuffer(cache.queue, g->buf_f, CL_TRUE, 0,
                                 2 * n * g->real_size, g->host_f, 0, NULL, NULL);
     if (err != CL_SUCCESS) goto fail;
-
-    for (size_t i = 0; i < n; i++) {
-        dx[i] += get_real(g, g->host_f, 2 * i);
-        dy[i] += get_real(g, g->host_f, 2 * i + 1);
-    }
+    forces_from_device(g, NULL, dx, dy);
+    g->t_fetch += fa2_now() - t0;
     return 0;
 
 fail:
@@ -517,24 +600,9 @@ int fa2_gpu_repulse_bh(fa2_gpu *g, const fa2_tree *t, double scaling,
     const size_t nreg = (size_t) t->nreg;
     cl_int err = CL_SUCCESS;
 
-    for (size_t k = 0; k < n; k++) {
-        put_real(g, g->host_p, 4 * k, t->px[k]);
-        put_real(g, g->host_p, 4 * k + 1, t->py[k]);
-        put_real(g, g->host_p, 4 * k + 2, t->pm[k]);
-        put_real(g, g->host_p, 4 * k + 3, t->ps ? t->ps[k] : 0.0);
-    }
-    for (size_t r = 0; r < nreg; r++) {
-        const fa2_region *reg = &t->reg[r];
-        put_real(g, g->host_rr, 4 * r, reg->cx);
-        put_real(g, g->host_rr, 4 * r + 1, reg->cy);
-        put_real(g, g->host_rr, 4 * r + 2, reg->mass);
-        put_real(g, g->host_rr, 4 * r + 3, reg->size * reg->size);
-        g->host_ri[4 * r] = reg->start;
-        g->host_ri[4 * r + 1] = reg->count;
-        g->host_ri[4 * r + 2] =
-            reg->nchild > 0 ? reg->child + reg->nchild - 1 : -1;
-        g->host_ri[4 * r + 3] = reg->skip;
-    }
+    double t0 = fa2_now(), t1;
+    nodes_to_device(g, t->px, t->py, t->pm, t->ps);
+    regions_to_device(g, t);
 
     err = cl->EnqueueWriteBuffer(cache.queue, g->buf_p, CL_TRUE, 0,
                                  4 * n * g->real_size, g->host_p, 0, NULL,
@@ -548,6 +616,9 @@ int fa2_gpu_repulse_bh(fa2_gpu *g, const fa2_tree *t, double scaling,
                                      4 * nreg * sizeof(int), g->host_ri, 0,
                                      NULL, NULL);
     if (err != CL_SUCCESS) goto fail;
+    t1 = fa2_now();
+    g->t_send += t1 - t0;
+    t0 = t1;
 
     err = set_arg_int(g, 0, g->n);
     if (!err) err = set_arg_real(g, 1, scaling);
@@ -569,15 +640,17 @@ int fa2_gpu_repulse_bh(fa2_gpu *g, const fa2_tree *t, double scaling,
         cl->Flush(cache.queue);
     }
 
+    err = cl->Finish(cache.queue);
+    if (err != CL_SUCCESS) goto fail;
+    t1 = fa2_now();
+    g->t_compute += t1 - t0;
+    t0 = t1;
+
     err = cl->EnqueueReadBuffer(cache.queue, g->buf_f, CL_TRUE, 0,
                                 2 * n * g->real_size, g->host_f, 0, NULL, NULL);
     if (err != CL_SUCCESS) goto fail;
-
-    for (size_t k = 0; k < n; k++) {
-        const int i = t->perm[k];
-        dx[i] += get_real(g, g->host_f, 2 * k);
-        dy[i] += get_real(g, g->host_f, 2 * k + 1);
-    }
+    forces_from_device(g, t->perm, dx, dy);
+    g->t_fetch += fa2_now() - t0;
     return 0;
 
 fail:
