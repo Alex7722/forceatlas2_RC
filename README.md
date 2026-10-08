@@ -17,10 +17,10 @@ From the source archive:
 install.packages("forceatlas2r_0.1.0.tar.gz", repos = NULL, type = "source")
 ```
 
-or, once the package is in a Git repository:
+or directly from GitHub:
 
 ```r
-remotes::install_github("<user>/forceatlas2r")
+remotes::install_github("Alex7722/forceatlas2_RC")
 ```
 
 The package contains C code, so installing it from source needs a C compiler:
